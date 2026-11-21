@@ -4,11 +4,11 @@ const VERSION = "__VERSION__";
 const SHELL = `mc-shell-${VERSION}`;
 const DATA = "mc-data";
 const ASSETS = [
-  "/", "/app.js", "/app.css", "/icons.js", "/graph.js", "/i18n.js", "/icon.svg", "/manifest.webmanifest",
+  "/", "/app.js", "/app.css", "/icons.js", "/graph.js", "/i18n.js", "/views.js", "/canvas.js", "/icon.svg", "/manifest.webmanifest",
   "/fonts/roboto-flex-latin.woff2", "/fonts/roboto-flex-latin-ext.woff2",
 ];
 // GET endpoints whose last response is kept for offline use.
-const CACHEABLE = ["/api/session", "/api/tree", "/api/tags", "/api/note", "/api/links", "/api/history", "/api/templates", "/api/embed-status", "/api/file/"];
+const CACHEABLE = ["/api/session", "/api/tree", "/api/tags", "/api/note", "/api/links", "/api/history", "/api/templates", "/api/embed-status", "/api/file/", "/api/tasks", "/api/canvas", "/api/preview"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(SHELL).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
@@ -29,9 +29,28 @@ self.addEventListener("message", (e) => {
 const offline = () =>
   new Response(JSON.stringify({ error: "offline", offline: true }), { status: 503, headers: { "content-type": "application/json" } });
 
+// Share target: keep what was shared, then open the app which shows a save dialog.
+async function receiveShare(req) {
+  try {
+    const form = await req.formData();
+    const cache = await caches.open("mc-share");
+    const files = form.getAll("files").filter((f) => f && f.size);
+    for (let i = 0; i < files.length; i++) {
+      await cache.put(`/__share__/file/${i}`, new Response(files[i], { headers: { "content-type": files[i].type || "application/octet-stream" } }));
+    }
+    const meta = { title: form.get("title") || "", text: form.get("text") || "", url: form.get("url") || "", files: files.map((f) => ({ name: f.name, type: f.type })) };
+    await cache.put("/__share__", new Response(JSON.stringify(meta), { headers: { "content-type": "application/json" } }));
+  } catch {}
+  return Response.redirect("/#/share", 303);
+}
+
 self.addEventListener("fetch", (e) => {
   const req = e.request;
   const url = new URL(req.url);
+  if (req.method === "POST" && url.origin === location.origin && url.pathname === "/share") {
+    e.respondWith(receiveShare(req));
+    return;
+  }
   if (url.origin !== location.origin || req.method !== "GET" || url.pathname.startsWith("/mcp")) return;
 
   if (url.pathname.startsWith("/api/")) {

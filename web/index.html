@@ -43,8 +43,15 @@
         <button class="btn fab-extended" id="new-note" type="button"><i data-icon="edit_note"></i><span data-i18n="action.newNote"></span></button>
         <button class="icon-btn tonal" id="new-folder" type="button" data-i18n-title="action.newFolder"><i data-icon="create_new_folder"></i></button>
         <button class="icon-btn tonal" id="open-daily" type="button" data-i18n-title="action.daily"><i data-icon="today"></i></button>
+        <button class="icon-btn tonal" id="new-canvas" type="button" data-i18n-title="action.newCanvas"><i data-icon="dashboard"></i></button>
       </div>
       <div class="drawer-scroll">
+        <div class="nav-list">
+          <a class="nav-item" href="#/tasks" data-nav="tasks"><i data-icon="checklist"></i><span data-i18n="nav.tasks"></span><span class="nav-badge" id="tasks-badge" hidden></span></a>
+          <a class="nav-item" href="#/calendar" data-nav="calendar"><i data-icon="calendar_month"></i><span data-i18n="nav.calendar"></span></a>
+          <a class="nav-item" href="#/activity" data-nav="activity"><i data-icon="smart_toy"></i><span data-i18n="nav.activity"></span></a>
+          <a class="nav-item" href="#/review" data-nav="review"><i data-icon="fact_check"></i><span data-i18n="nav.review"></span><span class="nav-badge" id="pending-badge" hidden></span></a>
+        </div>
         <div class="section-label label-large" data-i18n="nav.files"></div>
         <ul class="tree" id="tree" role="tree"></ul>
         <details class="tags-block" id="tags-block">
@@ -89,10 +96,15 @@
             <button type="button" data-fmt="code" data-i18n-title="fmt.code"><i data-icon="code"></i></button>
             <button type="button" data-fmt="wikilink" data-i18n-title="fmt.wikilink"><i data-icon="add_link"></i></button>
             <button type="button" data-fmt="tag" data-i18n-title="fmt.tag"><i data-icon="tag"></i></button>
+            <button type="button" data-fmt="base" data-i18n-title="fmt.base"><i data-icon="table"></i></button>
             <button type="button" data-fmt="template" data-i18n-title="fmt.template"><i data-icon="note_stack"></i></button>
             <button type="button" data-fmt="attach" data-i18n-title="fmt.attach"><i data-icon="attach_file"></i></button>
             <input type="file" id="file-input" hidden multiple>
           </div>
+          <details class="props-editor" id="props-editor">
+            <summary class="label-large"><i data-icon="sell"></i><span data-i18n="props.title"></span><span class="props-count" id="props-count"></span></summary>
+            <div class="props-rows" id="props-rows"></div>
+          </details>
           <div class="panes" id="panes">
             <div class="editor-wrap">
               <textarea id="editor" class="editor" spellcheck="false" autocapitalize="sentences"></textarea>
@@ -115,6 +127,12 @@
             <label class="switch-row label-large"><input type="checkbox" id="graph-orphans" checked><span class="switch"></span><span data-i18n="graph.orphans"></span></label>
           </div>
         </section>
+
+        <!-- Pages: tasks, calendar, activity, review -->
+        <section class="page-view" id="page-view" hidden></section>
+
+        <!-- Canvas -->
+        <section class="canvas-view" id="canvas-view" hidden></section>
 
         <!-- Empty -->
         <section class="empty-view" id="empty-view" hidden>
@@ -142,6 +160,8 @@
   <div class="menu suggest" id="suggest" hidden></div>
   <!-- Generic menu -->
   <div class="menu" id="menu" hidden></div>
+  <!-- Link hover preview -->
+  <div class="hover-card" id="hover-card" hidden></div>
   <!-- Snackbar -->
   <div class="snackbar" id="snackbar" hidden></div>
 
@@ -189,6 +209,44 @@
     </div>
   </dialog>
 
+  <!-- Connection editor -->
+  <dialog class="dialog basic" id="conn-dialog">
+    <form method="dialog" id="conn-form">
+      <h2 class="headline-small" id="conn-title"></h2>
+      <label class="text-field"><input id="conn-name" required placeholder=" " autocomplete="off"><span data-i18n="conn.name"></span></label>
+      <label class="text-field"><input id="conn-folders" placeholder=" " autocomplete="off"><span data-i18n="conn.folders"></span></label>
+      <p class="body-small muted" data-i18n="conn.foldersHint"></p>
+      <label class="switch-row label-large"><input type="checkbox" id="conn-readonly"><span class="switch"></span><span data-i18n="conn.readOnly"></span></label>
+      <label class="switch-row label-large"><input type="checkbox" id="conn-review"><span class="switch"></span><span data-i18n="conn.review"></span></label>
+      <div class="conn-token" id="conn-token" hidden></div>
+      <div class="dialog-actions">
+        <button class="btn text" value="cancel" type="submit" formnovalidate data-i18n="action.close"></button>
+        <button class="btn filled" value="ok" type="submit" id="conn-ok" data-i18n="action.save"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Share target -->
+  <dialog class="dialog basic" id="share-dialog">
+    <form method="dialog">
+      <h2 class="headline-small" data-i18n="share.title"></h2>
+      <label class="text-field"><input id="share-name" placeholder=" " autocomplete="off"><span data-i18n="share.name"></span></label>
+      <textarea id="share-text" class="code-area" rows="5"></textarea>
+      <div class="share-files body-small muted" id="share-files"></div>
+      <label class="select-field"><span class="label-medium muted" data-i18n="share.target"></span>
+        <select id="share-target">
+          <option value="daily" data-i18n="share.daily"></option>
+          <option value="inbox" data-i18n="share.inbox"></option>
+          <option value="new" data-i18n="share.new"></option>
+        </select>
+      </label>
+      <div class="dialog-actions">
+        <button class="btn text" value="cancel" type="submit" formnovalidate data-i18n="action.cancel"></button>
+        <button class="btn filled" value="ok" type="submit" data-i18n="action.save"></button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Settings -->
   <dialog class="dialog large" id="settings-dialog">
     <div class="dialog-head">
@@ -206,6 +264,16 @@
       <div class="swatches" id="swatches"></div>
       <label class="switch-row label-large"><input type="checkbox" id="opt-wide"><span class="switch"></span><span data-i18n="settings.wide"></span></label>
       <label class="switch-row label-large"><input type="checkbox" id="opt-spell"><span class="switch"></span><span data-i18n="settings.spell"></span></label>
+
+      <h3 class="title-medium"><i data-icon="shield"></i><span data-i18n="settings.privacy"></span></h3>
+      <p class="body-medium muted" data-i18n="settings.privacyIntro"></p>
+      <textarea id="ai-ignore" class="code-area" rows="5" spellcheck="false" placeholder="Özel/&#10;Sağlık/**&#10;*.secret.md"></textarea>
+      <div class="row-actions"><button class="btn tonal" id="ai-ignore-save" type="button"><i data-icon="check"></i><span data-i18n="action.save"></span></button><span class="body-small muted" id="ai-hidden-count"></span></div>
+
+      <h3 class="title-medium"><i data-icon="key"></i><span data-i18n="settings.connections"></span></h3>
+      <p class="body-medium muted" data-i18n="settings.connectionsIntro"></p>
+      <div id="conn-list" class="conn-list"></div>
+      <div class="row-actions"><button class="btn tonal" id="conn-add" type="button"><i data-icon="add"></i><span data-i18n="settings.connAdd"></span></button></div>
 
       <h3 class="title-medium"><i data-icon="smart_toy"></i><span data-i18n="settings.mcp"></span></h3>
       <p class="body-medium muted" data-i18n="settings.mcpIntro"></p>

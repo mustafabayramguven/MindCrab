@@ -2,6 +2,8 @@
 import { ICONS } from "/icons.js";
 import { t, applyI18n, LANG } from "/i18n.js";
 import { GraphView } from "/graph.js";
+import { createViews } from "/views.js";
+import { CanvasEditor } from "/canvas.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -240,7 +242,12 @@ function setMode(mode) {
 
 function showView(name) {
   S.view = name;
-  for (const v of ["note", "list", "graph", "empty"]) $(`#${v}-view`).hidden = v !== name;
+  $("#app").dataset.view = name;
+  if (name !== "canvas" && S.canvas) { S.canvas.destroy(); S.canvas = null; S.canvasPath = null; }
+  if (name !== "page") S.page = null;
+  for (const v of ["note", "list", "graph", "empty", "page", "canvas"]) $(`#${v}-view`).hidden = v !== name;
+  $$(".nav-list .nav-item").forEach((a) => a.classList.toggle("on", name === "page" && a.dataset.nav === S.page));
+  hideHover();
   const noteOnly = name === "note";
   $("#mode-switch").style.visibility = noteOnly ? "" : "hidden";
   $("#note-menu").style.visibility = noteOnly ? "" : "hidden";
@@ -249,30 +256,50 @@ function showView(name) {
   if (!noteOnly) { $("#crumbs").textContent = ""; }
 }
 
+function showPage(name, title) {
+  if (S.dirty) save();
+  S.page = name;
+  showView("page");
+  S.page = name;
+  $$(".nav-list .nav-item").forEach((a) => a.classList.toggle("on", a.dataset.nav === name));
+  $("#note-title").textContent = title;
+  document.title = `${title} · MindCrab`;
+  S.path = null;
+  highlightTree();
+  if (panelOpen()) loadPanel();
+  if (isMobile()) setDrawer(false);
+}
+
 // ------------------------------------------------------------------ tree
 async function loadTree() {
   const data = await api("GET", "/api/tree");
   S.notes = data.notes;
   S.folders = data.folders;
+  S.canvases = data.canvases || [];
+  S.hidden = new Set(data.hidden || []);
+  const pb = $("#pending-badge");
+  pb.hidden = !data.pending;
+  pb.textContent = data.pending || "";
   renderTree();
   return data;
 }
 
 function buildTree() {
-  const root = { name: "", path: "", folders: new Map(), notes: [] };
+  const root = { name: "", path: "", folders: new Map(), notes: [], canvases: [] };
   const ensure = (path) => {
     let node = root;
     if (!path) return node;
     let acc = "";
     for (const seg of path.split("/")) {
       acc = acc ? `${acc}/${seg}` : seg;
-      if (!node.folders.has(seg)) node.folders.set(seg, { name: seg, path: acc, folders: new Map(), notes: [] });
+      if (!node.folders.has(seg)) node.folders.set(seg, { name: seg, path: acc, folders: new Map(), notes: [], canvases: [] });
       node = node.folders.get(seg);
     }
     return node;
   };
   S.folders.forEach(ensure);
   for (const n of S.notes) ensure(dirOf(n.path)).notes.push(n);
+  for (const c of S.canvases || []) ensure(dirOf(c)).canvases.push(c);
   return root;
 }
 
@@ -292,7 +319,13 @@ function renderTree() {
     }
     for (const n of node.notes.sort((a, b) => coll.compare(stem(a.path), stem(b.path)))) {
       const li = document.createElement("li");
-      li.innerHTML = `<div class="tree-row${n.path === S.path ? " on" : ""}" data-note="${esc(n.path)}" draggable="true" tabindex="0" title="${esc(n.title)}">${I("description")}<span class="name">${esc(stem(n.path))}</span><button class="icon-btn small more" type="button">${I("more_vert")}</button></div>`;
+      const lock = S.hidden?.has(n.path) ? `<span title="${esc(t("hidden.badge"))}">${I("lock", "lock")}</span>` : "";
+      li.innerHTML = `<div class="tree-row${n.path === S.path ? " on" : ""}" data-note="${esc(n.path)}" draggable="true" tabindex="0" title="${esc(n.title)}">${I("description")}<span class="name">${esc(stem(n.path))}</span>${lock}<button class="icon-btn small more" type="button">${I("more_vert")}</button></div>`;
+      parent.append(li);
+    }
+    for (const c of (node.canvases || []).sort((a, b) => coll.compare(a, b))) {
+      const li = document.createElement("li");
+      li.innerHTML = `<div class="tree-row${c === S.canvasPath ? " on" : ""}" data-canvas="${esc(c)}" tabindex="0">${I("dashboard")}<span class="name">${esc(c.split("/").pop().replace(/\.canvas$/i, ""))}</span></div>`;
       parent.append(li);
     }
   };
@@ -313,6 +346,7 @@ function highlightTree() {
 $("#tree").addEventListener("click", (e) => {
   const row = e.target.closest(".tree-row");
   if (!row) return;
+  if (row.dataset.canvas) { location.hash = "#/c/" + encPath(row.dataset.canvas); return; }
   if (e.target.closest(".more")) {
     e.stopPropagation();
     return row.dataset.note ? noteMenu(e.target.closest(".more"), row.dataset.note) : folderMenu(e.target.closest(".more"), row.dataset.folder);
@@ -331,7 +365,7 @@ $("#tree").addEventListener("keydown", (e) => {
 });
 $("#tree").addEventListener("contextmenu", (e) => {
   const row = e.target.closest(".tree-row");
-  if (!row) return;
+  if (!row || row.dataset.canvas) return;
   e.preventDefault();
   const at = { x: e.clientX, y: e.clientY };
   row.dataset.note ? noteMenu(at, row.dataset.note) : folderMenu(at, row.dataset.folder);
@@ -373,6 +407,7 @@ function folderMenu(anchor, folder) {
   openMenu(anchor, [
     { icon: "note_add", label: t("action.newHere"), run: () => newNote(folder) },
     { icon: "create_new_folder", label: t("action.folderHere"), run: () => newFolder(folder) },
+    { icon: "dashboard", label: t("action.newCanvas"), run: () => newCanvas(folder) },
     { icon: "drive_file_move", label: t("action.renameFolder"), run: () => renameFolder(folder) },
     "-",
     { icon: "delete", label: t("action.delete"), danger: true, run: () => deleteFolder(folder) },
@@ -415,6 +450,7 @@ async function openNote(path, { keepScroll = false } = {}) {
   showView("note");
   setTitle();
   setSaveState("saved");
+  renderProps();
   const draft = drafts.get(note.path);
   if (draft && draft.content !== note.content) {
     let use = draft.base === note.hash;
@@ -531,6 +567,7 @@ function renderPreview(now = false) {
         ? `<div class="props">${props.map(([k, v]) => `<span class="prop"><b>${esc(k)}</b>${esc(Array.isArray(v) ? v.join(", ") : typeof v === "object" ? JSON.stringify(v) : v)}</span>`).join("")}</div>`
         : "";
       pv.innerHTML = propsHtml + r.html;
+      enhance(pv);
       pv.querySelectorAll('input[type="checkbox"]').forEach((cb, i) => { cb.disabled = false; cb.dataset.task = i; });
       if (S.pendingAnchor) { scrollToHeading(S.pendingAnchor); S.pendingAnchor = null; }
     } catch (e) {
@@ -621,6 +658,31 @@ async function renameNote(from, to) {
   } catch (e) { fail(e); }
 }
 
+async function newCanvas(folder = "") {
+  const name = await dialogPrompt({ title: t("action.newCanvas"), label: t("canvas.newName"), value: (folder ? folder + "/" : "") + (LANG === "tr" ? "Tuval" : "Canvas") });
+  if (!name) return;
+  try {
+    const r = await api("PUT", "/api/canvas", { path: name, content: { nodes: [], edges: [] } });
+    await loadTree();
+    location.hash = "#/c/" + encPath(r.path);
+  } catch (e) { fail(e); }
+}
+
+async function showCanvas(path) {
+  if (S.dirty) await save();
+  showView("canvas");
+  S.canvasPath = path;
+  $("#note-title").textContent = path.split("/").pop().replace(/\.canvas$/i, "");
+  $("#crumbs").textContent = dirOf(path).split("/").filter(Boolean).join(" › ");
+  document.title = `${$("#note-title").textContent} · MindCrab`;
+  S.path = null;
+  highlightTree();
+  renderTree();
+  if (isMobile()) setDrawer(false);
+  S.canvas = new CanvasEditor($("#canvas-view"), path, { api, I, t, esc, go, fail, dialogPrompt, enhance });
+  try { await S.canvas.load(); } catch (e) { fail(e); }
+}
+
 async function renameFolder(folder) {
   const to = await dialogPrompt({ title: t("action.renameFolder"), label: t("prompt.path"), value: folder, ok: t("action.save") });
   if (!to || to === folder) return;
@@ -706,6 +768,12 @@ const FMT = {
   tag: () => insert("#"),
   attach: () => $("#file-input").click(),
   template: () => insertTemplate(),
+  base: () => {
+    const s = ed.selectionStart;
+    const before = ed.value.slice(0, s);
+    const pre = before && !before.endsWith("\n\n") ? (before.endsWith("\n") ? "\n" : "\n\n") : "";
+    insert(`${pre}\`\`\`base\nfrom: ${dirOf(S.path || "") || "Folder"}\nwhere:\n  - has tags\ncolumns: [title, tags, modified]\nsort: -modified\nview: table\n\`\`\`\n`);
+  },
 };
 
 async function insertTemplate() {
@@ -932,25 +1000,26 @@ function diffLines(a, b) {
   return out;
 }
 
+/** Line diff as HTML with 2 lines of context: "del" = only in `a`, "add" = only in `b`. */
+function renderDiff(a, b) {
+  const diff = diffLines(a || "", b || "");
+  if (!diff) return esc(b);
+  const keep = diff.map((x, i) => x[0] !== "same" || diff.slice(Math.max(0, i - 2), i + 3).some((y) => y[0] !== "same"));
+  let html = "", gap = false;
+  diff.forEach(([k, line], i) => {
+    if (!keep[i]) { if (!gap) { html += `<span class="gap">⋯</span>`; gap = true; } return; }
+    gap = false;
+    html += `<span class="${k === "add" ? "add" : k === "del" ? "del" : "same"}">${esc(line) || " "}</span>`;
+  });
+  return html || esc(b);
+}
+
 async function showRevision(id) {
   try {
     const r = await api("GET", "/api/revision?id=" + id);
     const d = $("#revision-dialog");
     $("#revision-title").textContent = `${t("history.title")} #${id}`;
-    const diff = diffLines($("#editor").value, r.content);
-    const body = $("#revision-body");
-    if (!diff) body.textContent = r.content;
-    else {
-      // Show changes with 2 lines of context; "del" = only in current, "add" = only in that version.
-      const keep = diff.map((x, i) => x[0] !== "same" || diff.slice(Math.max(0, i - 2), i + 3).some((y) => y[0] !== "same"));
-      let html = "", gap = false;
-      diff.forEach(([k, line], i) => {
-        if (!keep[i]) { if (!gap) { html += `<span class="gap">⋯</span>`; gap = true; } return; }
-        gap = false;
-        html += `<span class="${k === "add" ? "add" : k === "del" ? "del" : "same"}">${esc(line) || " "}</span>`;
-      });
-      body.innerHTML = html || esc(r.content);
-    }
+    $("#revision-body").innerHTML = renderDiff($("#editor").value, r.content);
     $("#revision-restore").onclick = async () => {
       try {
         if (S.dirty) await save();
@@ -1089,6 +1158,8 @@ async function openSettings() {
   try {
     renderSemantic();
     renderOfflineStatus();
+    views.renderPrivacy();
+    views.renderConnections();
     const [info, sess] = await Promise.all([api("GET", "/api/mcp-info"), api("GET", "/api/session")]);
     $("#version").textContent = `MindCrab v${sess.version}`;
     const mask = (s) => s.slice(0, 6) + "•".repeat(12) + s.slice(-4);
@@ -1191,6 +1262,18 @@ async function route() {
       return;
     }
     if (h === "/graph") return await showGraph();
+    if (h === "/tasks") return await views.showTasks();
+    if (h === "/calendar") return await views.showCalendar();
+    if (h === "/activity") return await views.showActivity();
+    if (h === "/review") return await views.showReview();
+    if (h === "/daily") { history.replaceState(null, "", location.pathname); return openDaily(); }
+    if (h.startsWith("/c/")) return await showCanvas(decodeURIComponent(h.slice(3)));
+    if (h === "/share" || h === "/share-failed") {
+      history.replaceState(null, "", location.pathname);
+      if (h === "/share-failed") toast(t("share.failed"));
+      else await views.handleShare();
+      if (S.view !== "empty") return;
+    }
     const last = store.get("last", null);
     const pick = [last, "Welcome.md", "MEMORY.md"].find((p) => p && S.notes.some((n) => n.path === p)) || S.notes[0]?.path;
     if (pick) return go(pick);
@@ -1207,6 +1290,7 @@ async function poll() {
     await loadTree();
     loadTags();
     highlightTree();
+    views.refreshTaskBadge();
     const now = S.notes.find((n) => n.path === S.path);
     if (S.view === "note" && S.path && !S.dirty && !S.saving && now && now.mtime !== before && document.activeElement !== ed) {
       const fresh = await api("GET", "/api/note?path=" + encodeURIComponent(S.path));
@@ -1227,6 +1311,7 @@ $("#open-search").onclick = openSearch;
 $("#new-note").onclick = () => newNote();
 $("#fab").onclick = () => newNote();
 $("#new-folder").onclick = () => newFolder();
+$("#new-canvas").onclick = () => newCanvas(S.path ? dirOf(S.path) : "");
 $("#open-daily").onclick = openDaily;
 $("#nav-graph").onclick = () => (location.hash = "#/graph");
 $("#nav-settings").onclick = openSettings;
@@ -1255,6 +1340,230 @@ document.addEventListener("keydown", (e) => {
 });
 addEventListener("resize", () => { if (!isMobile()) $("#app").classList.remove("panel-open-mobile"); });
 
+// ------------------------------------------------------------------ rich rendering: math, mermaid, bases
+const loaded = {};
+function loadScript(src) {
+  return (loaded[src] ||= new Promise((res, rej) => {
+    const el = document.createElement("script");
+    el.src = src;
+    el.onload = res;
+    el.onerror = rej;
+    document.head.append(el);
+  }));
+}
+function loadCss(href) {
+  if (loaded[href]) return;
+  loaded[href] = true;
+  const l = document.createElement("link");
+  l.rel = "stylesheet";
+  l.href = href;
+  document.head.append(l);
+}
+let mermaidReady = null;
+async function enhance(root) {
+  const math = root.querySelectorAll(".math-inline, .math-display");
+  if (math.length) {
+    loadCss("/vendor/katex/katex.min.css");
+    try {
+      await loadScript("/vendor/katex/katex.min.js");
+      math.forEach((el) => {
+        if (el.dataset.done) return;
+        el.dataset.done = 1;
+        try { window.katex.render(el.textContent, el, { displayMode: el.classList.contains("math-display"), throwOnError: false }); }
+        catch { el.classList.add("raw"); }
+      });
+    } catch { math.forEach((el) => el.classList.add("raw")); }
+  }
+  const mm = root.querySelectorAll("pre > code.language-mermaid");
+  if (mm.length) {
+    try {
+      await loadScript("/vendor/mermaid.min.js");
+      const dark = document.documentElement.classList.contains("dark");
+      if (mermaidReady !== dark) {
+        window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "default", fontFamily: "Roboto Flex, system-ui, sans-serif" });
+        mermaidReady = dark;
+      }
+      let i = 0;
+      for (const code of mm) {
+        const pre = code.parentElement;
+        try {
+          const { svg } = await window.mermaid.render(`mm-${Date.now()}-${i++}`, code.textContent);
+          const div = document.createElement("div");
+          div.className = "mermaid";
+          div.innerHTML = svg;
+          pre.replaceWith(div);
+        } catch (e) { pre.title = String(e?.message || e); }
+      }
+    } catch {}
+  }
+  for (const el of root.querySelectorAll(".base-view[data-spec]")) {
+    if (el.dataset.done) continue;
+    el.dataset.done = 1;
+    renderBase(el, el.dataset.spec);
+  }
+}
+
+function fmtCell(v, col, path) {
+  if (v === null || v === undefined || v === "") return "";
+  if (col === "title" || col === "name") return `<a class="wikilink" href="#/n/${encPath(path)}">${esc(v)}</a>`;
+  if (Array.isArray(v)) return v.map((x) => `<span class="pill">${esc(typeof x === "object" ? JSON.stringify(x) : x)}</span>`).join(" ");
+  if (typeof v === "boolean") return v ? "✓" : "✗";
+  if (typeof v === "object") return esc(JSON.stringify(v));
+  return esc(v);
+}
+
+async function renderBase(el, spec) {
+  let r;
+  try { r = await api("POST", "/api/base", { spec }); }
+  catch (e) { el.innerHTML = `<div class="base-error">${esc(e.message)}</div>`; return; }
+  let sortCol = null, desc = false;
+  const draw = () => {
+    let rows = [...r.rows];
+    if (sortCol !== null) {
+      rows.sort((a, b) => {
+        const x = a.values[sortCol], y = b.values[sortCol];
+        const o = typeof x === "number" && typeof y === "number" ? x - y : String(x ?? "").localeCompare(String(y ?? ""), LANG, { numeric: true });
+        return desc ? -o : o;
+      });
+    }
+    const head = `<div class="base-head">${I("table")}<span>${r.total}</span><span class="sp"></span></div>`;
+    if (r.view === "cards") {
+      el.innerHTML = head + `<div class="base-cards">${rows.map((row) => `<a class="base-card" href="#/n/${encPath(row.path)}">${row.values.map((v, i) => i === 0 ? `<b>${esc(v ?? stem(row.path))}</b>` : v === null || v === "" ? "" : `<div><span class="muted">${esc(r.columns[i])}:</span> ${fmtCell(v, r.columns[i], row.path)}</div>`).join("")}</a>`).join("")}</div>`;
+    } else if (r.view === "list") {
+      el.innerHTML = head + `<ul style="margin:8px 0;padding-left:32px">${rows.map((row) => `<li><a class="wikilink" href="#/n/${encPath(row.path)}">${esc(row.values[0] ?? stem(row.path))}</a></li>`).join("")}</ul>`;
+    } else {
+      el.innerHTML = head + `<div class="scroll"><table><thead><tr>${r.columns.map((c, i) => `<th data-i="${i}">${esc(c)}${sortCol === i ? (desc ? " ↓" : " ↑") : ""}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map((row) => `<tr>${row.values.map((v, i) => `<td>${fmtCell(v, r.columns[i], row.path)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+      el.querySelectorAll("th").forEach((th) => th.addEventListener("click", () => {
+        const i = +th.dataset.i;
+        desc = sortCol === i ? !desc : false;
+        sortCol = i;
+        draw();
+      }));
+    }
+  };
+  draw();
+}
+
+// ------------------------------------------------------------------ hover preview for links
+const hover = { timer: null, hideTimer: null, cache: new Map(), anchor: null };
+function hideHover() { clearTimeout(hover.timer); $("#hover-card").hidden = true; hover.anchor = null; }
+async function showHover(a) {
+  const key = a.dataset.note + "#" + (a.dataset.anchor || "");
+  let r = hover.cache.get(key);
+  if (!r) {
+    try { r = await api("GET", `/api/preview?path=${encodeURIComponent(a.dataset.note)}&anchor=${encodeURIComponent(a.dataset.anchor || "")}`); }
+    catch { return; }
+    hover.cache.set(key, r);
+    setTimeout(() => hover.cache.delete(key), 30000);
+  }
+  if (hover.anchor !== a) return;
+  const card = $("#hover-card");
+  card.innerHTML = `<div class="hc-title">${esc(r.title)}</div><div class="markdown">${r.html}</div>`;
+  card.hidden = false;
+  enhance(card);
+  const rect = a.getBoundingClientRect();
+  const w = card.offsetWidth, hgt = card.offsetHeight;
+  let x = Math.min(rect.left, innerWidth - w - 12), y = rect.bottom + 8;
+  if (y + hgt > innerHeight - 12) y = Math.max(12, rect.top - hgt - 8);
+  card.style.left = Math.max(12, x) + "px";
+  card.style.top = y + "px";
+}
+document.addEventListener("mouseover", (e) => {
+  if (!matchMedia("(hover: hover)").matches) return;
+  const a = e.target.closest("#preview a.wikilink[data-note], #panel-body a.panel-item[href^='#/n/'], .hover-card a.wikilink[data-note]");
+  if (e.target.closest("#hover-card")) { clearTimeout(hover.hideTimer); return; }
+  if (!a) { if (hover.anchor) { clearTimeout(hover.hideTimer); hover.hideTimer = setTimeout(hideHover, 250); } return; }
+  if (!a.dataset.note) a.dataset.note = decodeURIComponent(a.getAttribute("href").slice(4));
+  if (hover.anchor === a) return;
+  clearTimeout(hover.timer);
+  clearTimeout(hover.hideTimer);
+  hover.anchor = a;
+  hover.timer = setTimeout(() => showHover(a), 450);
+});
+document.addEventListener("click", () => hideHover(), true);
+
+// ------------------------------------------------------------------ properties (frontmatter) editor
+function parseFm(text) {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/);
+  if (!m) return { ok: true, entries: [], end: 0 };
+  const lines = m[1].split(/\r?\n/);
+  const entries = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!l.trim() || l.trim().startsWith("#")) continue;
+    const kv = l.match(/^([^\s:#][^:]*):\s*(.*)$/);
+    if (!kv) return { ok: false };
+    const key = kv[1].trim();
+    let val = kv[2].trim();
+    if (val === "" ) {
+      const items = [];
+      while (i + 1 < lines.length && /^\s*-\s/.test(lines[i + 1])) items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
+      if (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]) && !items.length) return { ok: false };
+      entries.push([key, items.length ? items : ""]);
+    } else if (val.startsWith("[") && val.endsWith("]")) {
+      entries.push([key, val.slice(1, -1).split(",").map((x) => x.trim().replace(/^["']|["']$/g, "")).filter(Boolean)]);
+    } else if (val === "|" || val === ">" || val.startsWith("{")) {
+      return { ok: false };
+    } else entries.push([key, val.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1")]);
+  }
+  return { ok: true, entries, end: m[0].length };
+}
+function yamlScalar(v) {
+  if (v === "" || /^[\w\-./+ ]*$/u.test(v) && !/^(true|false|null|yes|no|~)$/i.test(v) && !/^\d/.test(v) && !/^\s|\s$/.test(v)) return v;
+  if (/^-?\d+(\.\d+)?$/.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v) || /^(true|false)$/i.test(v)) return v;
+  return JSON.stringify(v);
+}
+function writeFm(entries) {
+  const body = ed.value.replace(/^---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/, "");
+  const live = entries.filter(([k]) => k.trim());
+  if (!live.length) { ed.value = body; onEdit(); return; }
+  const yaml = live.map(([k, v]) => Array.isArray(v) ? `${k.trim()}: [${v.map(yamlScalar).join(", ")}]` : `${k.trim()}: ${yamlScalar(String(v))}`).join("\n");
+  ed.value = `---\n${yaml}\n---\n${body}`;
+  onEdit();
+}
+const ARRAY_KEYS = new Set(["tags", "tag", "aliases", "alias", "cssclasses"]);
+function renderProps() {
+  const box = $("#props-rows");
+  if (!box || S.view !== "note") return;
+  if (document.activeElement && box.contains(document.activeElement)) return; // don't fight the user
+  const fm = parseFm(ed.value);
+  $("#props-count").textContent = fm.ok ? (fm.entries.length || "") : "";
+  if (!fm.ok) { box.innerHTML = `<p class="props-note">${esc(t("props.complex"))}</p>`; return; }
+  box.innerHTML = fm.entries.map(([k, v], i) => `<div class="prop-row" data-i="${i}" data-arr="${Array.isArray(v) ? 1 : 0}">
+      <input class="k" value="${esc(k)}" placeholder="${esc(t("props.key"))}">
+      <input class="v" value="${esc(Array.isArray(v) ? v.join(", ") : v)}" placeholder="${esc(t("props.value"))}">
+      <button class="icon-btn small" type="button" data-del>${I("close")}</button></div>`).join("")
+    + `<div><button class="btn text" type="button" id="prop-add">${I("add")}${esc(t("props.add"))}</button></div>`;
+}
+function collectProps() {
+  return $$("#props-rows .prop-row").map((r) => {
+    const k = r.querySelector(".k").value, raw = r.querySelector(".v").value;
+    const arr = r.dataset.arr === "1" || ARRAY_KEYS.has(k.trim().toLowerCase());
+    return [k, arr ? raw.split(",").map((x) => x.trim()).filter(Boolean) : raw.trim()];
+  });
+}
+$("#props-rows").addEventListener("change", () => writeFm(collectProps()));
+$("#props-rows").addEventListener("click", (e) => {
+  if (e.target.closest("[data-del]")) {
+    e.target.closest(".prop-row").remove();
+    writeFm(collectProps());
+    renderProps();
+  } else if (e.target.closest("#prop-add")) {
+    const entries = collectProps();
+    entries.push(["", ""]);
+    const box = $("#props-rows");
+    box.querySelector("#prop-add").parentElement.insertAdjacentHTML("beforebegin", `<div class="prop-row" data-i="${entries.length - 1}" data-arr="0">
+      <input class="k" placeholder="${esc(t("props.key"))}"><input class="v" placeholder="${esc(t("props.value"))}">
+      <button class="icon-btn small" type="button" data-del>${I("close")}</button></div>`);
+    box.querySelector(".prop-row:last-of-type .k")?.focus();
+  }
+});
+let propsTimer;
+ed.addEventListener("input", () => { clearTimeout(propsTimer); propsTimer = setTimeout(renderProps, 600); });
+
+const views = createViews({ $, $$, esc, api, t, toast, fail, I, go, S, fmtTime, fmtFull, stem, dirOf, encPath, dialogPrompt, store, LANG, renderDiff, copy, showPage, loadTree });
+
 // ------------------------------------------------------------------ login & boot
 function showLogin() {
   $("#app").hidden = true;
@@ -1275,7 +1584,7 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 async function boot() {
-  try { await api("GET", "/api/session", undefined, { noAuthRedirect: true }); }
+  try { S.settings = (await api("GET", "/api/session", undefined, { noAuthRedirect: true })).settings; }
   catch (e) { if (e.status === 401) return showLogin(); return toast(e.message); }
   $("#login").hidden = true;
   $("#app").hidden = false;
@@ -1285,6 +1594,7 @@ async function boot() {
   $("#offline-banner").hidden = !S.offline;
   await Promise.all([loadTree(), loadTags(), api("GET", "/api/embed-status").then((st) => (S.semantic = st.enabled)).catch(() => {})]);
   route();
+  views.refreshTaskBadge();
   if ("serviceWorker" in navigator && isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 

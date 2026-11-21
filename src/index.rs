@@ -13,8 +13,13 @@ pub const SNIP_START: char = '\u{E000}';
 pub const SNIP_END: char = '\u{E001}';
 const MAX_REVISIONS_PER_NOTE: i64 = 100;
 
+/// Bump when derived data changes shape; forces a full re-read of the vault.
+const SCHEMA_VERSION: i64 = 3;
+
 pub struct Index {
-    conn: Connection,
+    pub(crate) conn: Connection,
+    /// Set when the on-disk schema is older than this build (full reindex needed).
+    pub needs_reindex: bool,
     /// Bumped whenever stored vectors may have changed (for the in-memory vector cache).
     pub vec_gen: u64,
 }
@@ -155,9 +160,89 @@ impl Index {
             );
             CREATE INDEX IF NOT EXISTS chunks_pending ON chunks(path) WHERE vec IS NULL;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS tasks(
+                path TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
+                line INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                raw TEXT NOT NULL,
+                done INTEGER NOT NULL,
+                due TEXT,
+                scheduled TEXT,
+                done_date TEXT,
+                priority INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tasks_path ON tasks(path);
+            CREATE TABLE IF NOT EXISTS activity(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                rev INTEGER,
+                floor INTEGER NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pending_facts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                topic TEXT,
+                fact TEXT NOT NULL,
+                tags TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS connections(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_hint TEXT NOT NULL,
+                read_only INTEGER NOT NULL,
+                review INTEGER NOT NULL,
+                folders TEXT NOT NULL,
+                created INTEGER NOT NULL,
+                last_used INTEGER
+            );
             "#,
         )?;
-        Ok(Self { conn, vec_gen: 0 })
+        // Migrations for databases created by older versions.
+        let has_col = |table: &str, col: &str| -> Result<bool> {
+            let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let cols = st
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(cols.iter().any(|c| c == col))
+        };
+        if !has_col("notes", "private")? {
+            conn.execute(
+                "ALTER TABLE notes ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let ver: i64 = conn
+            .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let empty: i64 = conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))?;
+        let mut me = Self {
+            conn,
+            vec_gen: 0,
+            needs_reindex: ver < SCHEMA_VERSION,
+        };
+        if empty == 0 && me.needs_reindex {
+            me.mark_reindexed()?; // fresh database: nothing to migrate
+        }
+        Ok(me)
+    }
+
+    pub fn mark_reindexed(&mut self) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('schema',?1) ON CONFLICT(key) DO UPDATE SET value=?1",
+            [SCHEMA_VERSION.to_string()],
+        )?;
+        self.needs_reindex = false;
+        Ok(())
     }
 
     pub fn note_state(&self, path: &str) -> Result<Option<(String, i64, i64)>> {
@@ -191,7 +276,7 @@ impl Index {
             )
             .optional()?;
         if let Some((old_hash, old_content)) = &old {
-            if *old_hash == new_hash {
+            if *old_hash == new_hash && !self.needs_reindex {
                 tx.execute(
                     "UPDATE notes SET size=?2, mtime=?3 WHERE path=?1",
                     params![path, size, mtime],
@@ -199,7 +284,7 @@ impl Index {
                 tx.commit()?;
                 return Ok(false);
             }
-            if !old_content.is_empty() {
+            if !old_content.is_empty() && *old_hash != new_hash {
                 tx.execute(
                     "INSERT INTO revisions(path, content, hash, created_at, source) VALUES(?1,?2,?3,?4,?5)",
                     params![path, old_content, old_hash, now_ms(), source],
@@ -209,11 +294,31 @@ impl Index {
         }
         let p: Parsed = note::parse(path, content);
         let fm = serde_json::to_string(&p.frontmatter)?;
+        let private = crate::scope::frontmatter_private(&p.frontmatter);
         tx.execute(
-            "INSERT INTO notes(path,title,hash,size,mtime,frontmatter,content) VALUES(?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(path) DO UPDATE SET title=?2,hash=?3,size=?4,mtime=?5,frontmatter=?6,content=?7",
-            params![path, p.title, new_hash, size, mtime, fm, content],
+            "INSERT INTO notes(path,title,hash,size,mtime,frontmatter,content,private) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(path) DO UPDATE SET title=?2,hash=?3,size=?4,mtime=?5,frontmatter=?6,content=?7,private=?8",
+            params![path, p.title, new_hash, size, mtime, fm, content, private],
         )?;
+        tx.execute("DELETE FROM tasks WHERE path=?1", [path])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO tasks(path,line,text,raw,done,due,scheduled,done_date,priority) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )?;
+            for t in crate::tasks::parse(content) {
+                ins.execute(params![
+                    path,
+                    t.line as i64,
+                    t.text,
+                    t.raw,
+                    t.done,
+                    t.due,
+                    t.scheduled,
+                    t.done_date,
+                    t.priority
+                ])?;
+            }
+        }
         tx.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
         tx.execute(
             "INSERT INTO notes_fts(path,title,body,tags) VALUES(?1,?2,?3,?4)",

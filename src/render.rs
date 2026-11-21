@@ -38,9 +38,68 @@ fn split_target(dest: &str) -> (&str, Option<&str>) {
 }
 
 /// Renders note content (frontmatter is stripped) for the note at `src`.
+#[cfg(test)]
 pub fn render(src: &str, content: &str, resolver: &Resolver) -> String {
+    render_with(src, content, resolver, &|_| None)
+}
+
+/// Like [`render`], with a loader so `![[Note]]` / `![[Note#Heading]]` can embed other notes.
+pub fn render_with(
+    src: &str,
+    content: &str,
+    resolver: &Resolver,
+    load: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let mut seen = vec![src.to_string()];
+    sanitize(&render_inner(src, content, resolver, load, &mut seen))
+}
+
+const MAX_EMBED_DEPTH: usize = 3;
+
+/// Extracts the part of a note under a heading (until the next heading of the same or a
+/// higher level), or the paragraph carrying a `^block-id`.
+pub fn section(content: &str, frag: &str) -> Option<String> {
+    let (_, body) = note::split_frontmatter(content);
+    let lines: Vec<&str> = body.lines().collect();
+    if let Some(id) = frag.strip_prefix('^') {
+        let marker = format!("^{id}");
+        let l = lines.iter().find(|l| l.trim_end().ends_with(&marker))?;
+        return Some(
+            l.trim_end()
+                .trim_end_matches(&marker)
+                .trim_end()
+                .to_string(),
+        );
+    }
+    let want = frag.trim().to_lowercase();
+    let level_of = |l: &str| {
+        let t = l.trim_start();
+        let n = t.chars().take_while(|c| *c == '#').count();
+        ((1..=6).contains(&n) && t[n..].starts_with(' ')).then_some(n)
+    };
+    let start = lines.iter().position(|l| {
+        level_of(l).is_some()
+            && l.trim_start().trim_start_matches('#').trim().to_lowercase() == want
+    })?;
+    let lvl = level_of(lines[start]).unwrap();
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| level_of(l).is_some_and(|n| n <= lvl))
+        .map(|i| start + 1 + i)
+        .unwrap_or(lines.len());
+    Some(lines[start + 1..end].join("\n"))
+}
+
+fn render_inner(
+    src: &str,
+    content: &str,
+    resolver: &Resolver,
+    load: &dyn Fn(&str) -> Option<String>,
+    seen: &mut Vec<String>,
+) -> String {
     let (_, body) = note::split_frontmatter(content);
     let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_MATH
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -54,8 +113,26 @@ pub fn render(src: &str, content: &str, resolver: &Resolver) -> String {
     let mut skip_depth: Option<usize> = None;
     let mut depth = 0usize;
     let mut link_stack: Vec<bool> = Vec::new();
+    // Collects the text of a ```base block.
+    let mut base_block: Option<String> = None;
 
     for ev in Parser::new_ext(body, opts) {
+        if let Some(buf) = base_block.as_mut() {
+            match ev {
+                Event::Text(t) => buf.push_str(&t),
+                Event::End(TagEnd::CodeBlock) => {
+                    depth -= 1;
+                    in_code = false;
+                    let spec = base_block.take().unwrap_or_default();
+                    events.push(Event::Html(CowStr::from(format!(
+                        "<div class=\"base-view\" data-spec=\"{}\"></div>\n",
+                        escape(&spec)
+                    ))));
+                }
+                _ => {}
+            }
+            continue;
+        }
         if let Some(d) = skip_depth {
             match &ev {
                 Event::Start(_) => depth += 1,
@@ -70,10 +147,29 @@ pub fn render(src: &str, content: &str, resolver: &Resolver) -> String {
             continue;
         }
         match ev {
+            Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(lang)))
+                if lang.trim() == "base" =>
+            {
+                in_code = true;
+                depth += 1;
+                base_block = Some(String::new());
+            }
             Event::Start(Tag::CodeBlock(k)) => {
                 in_code = true;
                 depth += 1;
                 events.push(Event::Start(Tag::CodeBlock(k)));
+            }
+            Event::InlineMath(m) => {
+                events.push(Event::InlineHtml(CowStr::from(format!(
+                    "<span class=\"math-inline\">{}</span>",
+                    escape(&m)
+                ))));
+            }
+            Event::DisplayMath(m) => {
+                events.push(Event::InlineHtml(CowStr::from(format!(
+                    "<span class=\"math-display\">{}</span>",
+                    escape(&m)
+                ))));
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code = false;
@@ -98,14 +194,42 @@ pub fn render(src: &str, content: &str, resolver: &Resolver) -> String {
                         url_encode(p),
                         escape(target)
                     ),
-                    (Some(p), false) if note::is_note_path(p) => format!(
-                        "<a class=\"embed wikilink\" data-note=\"{}\" href=\"#/n/{}\">{}{}</a>",
-                        escape(p),
-                        url_encode(p),
-                        escape(target),
-                        frag.map(|f| format!(" › {}", escape(f)))
-                            .unwrap_or_default()
-                    ),
+                    (Some(p), false) if note::is_note_path(p) => {
+                        let label = format!(
+                            "{}{}",
+                            escape(note::stem(p)),
+                            frag.map(|f| format!(" › {}", escape(f.trim_start_matches('^'))))
+                                .unwrap_or_default()
+                        );
+                        // Transclude the note (or one section of it).
+                        let block = dest_url.contains('^') && !dest_url.contains("#^");
+                        let inner = (seen.len() <= MAX_EMBED_DEPTH && !seen.iter().any(|x| x == p))
+                            .then(|| load(p))
+                            .flatten()
+                            .and_then(|c| match frag {
+                                Some(f) => {
+                                    section(&c, &format!("{}{f}", if block { "^" } else { "" }))
+                                }
+                                None => Some(note::split_frontmatter(&c).1.to_string()),
+                            });
+                        match inner {
+                            Some(md) => {
+                                seen.push(p.clone());
+                                let html = render_inner(p, &md, resolver, load, seen);
+                                seen.pop();
+                                format!(
+                                    "<div class=\"embed-note\"><a class=\"embed-title wikilink\" data-note=\"{}\" href=\"#/n/{}\">{label}</a><div class=\"embed-body\">{html}</div></div>",
+                                    escape(p),
+                                    url_encode(p)
+                                )
+                            }
+                            None => format!(
+                                "<a class=\"embed wikilink\" data-note=\"{}\" href=\"#/n/{}\">{label}</a>",
+                                escape(p),
+                                url_encode(p)
+                            ),
+                        }
+                    }
                     (Some(p), false) => {
                         format!(
                             "<a class=\"file\" href=\"/api/file/{}\" target=\"_blank\">{}</a>",
@@ -252,7 +376,7 @@ pub fn render(src: &str, content: &str, resolver: &Resolver) -> String {
 
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
-    sanitize(&out)
+    out
 }
 
 pub fn sanitize(html: &str) -> String {
@@ -269,6 +393,7 @@ pub fn sanitize(html: &str) -> String {
             ],
         )
         .add_tag_attributes("img", ["loading"])
+        .add_tag_attributes("div", ["data-spec"])
         .add_tags(["input"])
         .add_tag_attributes("input", ["type", "checked", "disabled"])
         .add_tag_attributes("code", ["class"])
@@ -321,6 +446,33 @@ mod tests {
         assert!(!h.contains("onerror"), "{h}");
         assert!(!h.contains("javascript:"), "{h}");
         assert!(!h.contains("<b onclick"), "{h}");
+    }
+
+    #[test]
+    fn transclusion_math_and_bases() {
+        let (_d, r) = resolver();
+        let load = |p: &str| {
+            (p == "Notes/Target.md").then(|| {
+                "# T\n\n## Bölüm\nİçerik burada ![[Target]]\n\n## Diğer\nyok\n\nsatır ^abc"
+                    .to_string()
+            })
+        };
+        let h = render_with(
+            "a.md",
+            "![[Target#Bölüm]]\n\n![[Target#^abc]]\n\n$e=mc^2$\n\n```base\nfrom: X\n```\n",
+            &r,
+            &load,
+        );
+        assert!(h.contains("embed-note"), "{h}");
+        assert!(h.contains("İçerik burada"), "{h}");
+        assert!(!h.contains(">yok<"), "{h}");
+        assert!(h.contains("satır"), "{h}");
+        assert!(h.contains("math-inline"), "{h}");
+        assert!(h.contains("data-spec=\"from: X"), "{h}");
+        assert_eq!(
+            section("# A\n## B\nx\n### C\ny\n## D\nz", "b").unwrap(),
+            "x\n### C\ny"
+        );
     }
 
     #[test]

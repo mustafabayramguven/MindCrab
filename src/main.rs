@@ -1,11 +1,17 @@
 mod app;
+mod bases;
 mod embed;
+mod features;
 mod index;
 mod mcp;
 mod note;
 mod render;
+mod review;
+mod scope;
 mod seed;
 mod server;
+mod store;
+mod tasks;
 mod vault;
 mod watch;
 mod web;
@@ -48,6 +54,9 @@ struct Cli {
     /// Only expose read tools over MCP.
     #[arg(long, env = "MINDCRAB_MCP_READ_ONLY", global = true)]
     mcp_read_only: bool,
+    /// Facts saved with `remember` over the main MCP token wait for approval in the web UI.
+    #[arg(long, env = "MINDCRAB_REVIEW_REMEMBER", global = true)]
+    review_remember: bool,
     /// Mark the login cookie Secure (set this when served over HTTPS).
     #[arg(long, env = "MINDCRAB_COOKIE_SECURE", global = true)]
     cookie_secure: bool,
@@ -202,7 +211,7 @@ fn main() -> Result<()> {
         }
         Cmd::Mcp => {
             app.full_sync()?;
-            stdio(app, cli.mcp_read_only)
+            stdio(app, cli.mcp_read_only, cli.review_remember)
         }
         Cmd::Serve => {
             let (changed, removed) = app.full_sync()?;
@@ -226,6 +235,7 @@ fn main() -> Result<()> {
                 web_token,
                 mcp_token,
                 mcp_read_only: cli.mcp_read_only,
+                mcp_review: cli.review_remember,
                 cookie_secure: cli.cookie_secure,
             };
             let router = server::router(server::shared(app, cfg));
@@ -264,11 +274,9 @@ async fn shutdown() {
 }
 
 /// Newline-delimited JSON-RPC over stdio.
-fn stdio(app: Arc<App>, read_only: bool) -> Result<()> {
-    let mut session = mcp::Session {
-        client: "stdio".into(),
-        read_only,
-    };
+fn stdio(app: Arc<App>, read_only: bool, review: bool) -> Result<()> {
+    let mut session = mcp::Session::new(scope::Scope::full("stdio", read_only, review), false);
+    session.client = "stdio".into();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {

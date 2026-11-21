@@ -53,7 +53,13 @@ pub struct App {
     waker: Mutex<Waker>,
     embed_error: Mutex<Option<String>>,
     vcache: Mutex<VecCache>,
+    pub(crate) ignore_cache: Mutex<IgnoreCache>,
 }
+
+type IgnoreCache = (
+    Option<std::time::SystemTime>,
+    Option<Arc<crate::scope::Ignore>>,
+);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NoteView {
@@ -125,6 +131,7 @@ impl App {
             waker: Mutex::new(Waker::none()),
             embed_error: Mutex::new(None),
             vcache: Mutex::new(None),
+            ignore_cache: Mutex::new((None, None)),
         })
     }
 
@@ -149,7 +156,13 @@ impl App {
         self.index.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn wlock(&self) -> MutexGuard<'_, ()> {
+    fn idx_mut_remove(&self, path: &str, source: &str) -> AResult<MutexGuard<'_, Index>> {
+        let mut idx = self.idx();
+        idx.remove(path, source)?;
+        Ok(idx)
+    }
+
+    pub(crate) fn wlock(&self) -> MutexGuard<'_, ()> {
         self.write_lock.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -165,6 +178,7 @@ impl App {
         let _w = self.wlock();
         let (notes, files, dirs) = self.vault.scan();
         let mut idx = self.idx();
+        let force = force || idx.needs_reindex;
         let mut changed = 0;
         let on_disk: std::collections::HashSet<&str> =
             notes.iter().map(|e| e.rel.as_str()).collect();
@@ -196,6 +210,9 @@ impl App {
             idx.upsert_file(&f.rel, f.size as i64, f.mtime)?;
         }
         idx.set_folders(&dirs)?;
+        if idx.needs_reindex {
+            idx.mark_reindexed()?;
+        }
         drop(idx);
         if changed + removed > 0 {
             self.wake();
@@ -306,7 +323,8 @@ impl App {
 
     pub fn render(&self, path: &str, content: &str) -> AResult<String> {
         let resolver = self.idx().resolver_snapshot()?;
-        Ok(render::render(path, content, &resolver))
+        let load = |p: &str| self.vault.read(p).ok();
+        Ok(render::render_with(path, content, &resolver, &load))
     }
 
     // ---------------------------------------------------------------- writes
@@ -334,7 +352,20 @@ impl App {
         Ok(current)
     }
 
-    fn persist(&self, path: &str, content: &str, source: &str) -> AResult<String> {
+    pub(crate) fn persist(&self, path: &str, content: &str, source: &str) -> AResult<String> {
+        self.persist_opts(path, content, source, true)
+    }
+
+    /// Writes + indexes a note. With `log`, records a create/update in the activity log.
+    pub(crate) fn persist_opts(
+        &self,
+        path: &str,
+        content: &str,
+        source: &str,
+        log: bool,
+    ) -> AResult<String> {
+        let existed = self.vault.exists(path);
+        let rev_before = self.idx().last_rev_for(path)?;
         if content.len() > vault::MAX_NOTE_BYTES {
             return Err(AppError::BadRequest(format!(
                 "note too large (max {} MB)",
@@ -344,9 +375,19 @@ impl App {
         self.vault.write(path, content.as_bytes())?;
         let m = self.vault.meta(path).context("stat after write")?;
         let mut idx = self.idx();
-        idx.upsert(path, content, m.size as i64, m.mtime, source)?;
+        let changed = idx.upsert(path, content, m.size as i64, m.mtime, source)?;
         if let Some(dir) = path.rsplit_once('/').map(|(d, _)| d) {
             idx.add_folder(dir)?;
+        }
+        if log && changed && source != "seed" {
+            let rev = idx.last_rev_for(path)?.filter(|r| Some(*r) != rev_before);
+            idx.log_activity(
+                source,
+                if existed { "update" } else { "create" },
+                path,
+                rev,
+                None,
+            )?;
         }
         drop(idx);
         self.wake();
@@ -466,7 +507,8 @@ impl App {
             return Err(AppError::NotFound(format!("note not found: {path}")));
         }
         self.vault.trash(&path)?;
-        self.idx().remove(&path, source)?;
+        let idx = self.idx_mut_remove(&path, source)?;
+        idx.log_activity(source, "delete", &path, idx.last_rev_for(&path)?, None)?;
         Ok(())
     }
 
@@ -513,7 +555,9 @@ impl App {
             idx.remove(&from, &format!("{source} (renamed to {to})"))?;
             idx.rename(&from, &to)?;
         }
-        self.persist(&to, &content, source)?;
+        self.persist_opts(&to, &content, source, false)?;
+        self.idx()
+            .log_activity(source, "move", &to, None, Some(&from))?;
 
         let new_stem = note::stem(&to).to_string();
         let stem_unique = self.idx().resolve_link("", &new_stem)?.as_deref() == Some(to.as_str());
@@ -583,24 +627,50 @@ impl App {
     }
 
     pub fn daily_path(&self, date: Option<&str>) -> AResult<String> {
+        self.period_path("day", date)
+    }
+
+    /// Journal note path for a day (`2026-11-21`), ISO week (`2026-W47`) or month (`2026-11`).
+    pub fn period_path(&self, period: &str, date: Option<&str>) -> AResult<String> {
+        use chrono::Datelike;
         let date = match date.map(str::trim).filter(|d| !d.is_empty()) {
             Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .or_else(|_| chrono::NaiveDate::parse_from_str(&format!("{d}-01"), "%Y-%m-%d"))
                 .map_err(|_| AppError::BadRequest("date must be YYYY-MM-DD".into()))?,
             None => chrono::Local::now().date_naive(),
         };
-        Ok(format!(
-            "{}/{}.md",
-            self.settings.daily_dir,
-            date.format("%Y-%m-%d")
-        ))
+        let name = match period {
+            "week" => {
+                let w = date.iso_week();
+                format!("{}-W{:02}", w.year(), w.week())
+            }
+            "month" => date.format("%Y-%m").to_string(),
+            "day" | "" => date.format("%Y-%m-%d").to_string(),
+            other => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown period '{other}' (day, week, month)"
+                )));
+            }
+        };
+        Ok(format!("{}/{name}.md", self.settings.daily_dir))
     }
 
     /// Returns today's (or the given day's) journal note, creating it if needed.
     pub fn ensure_daily(&self, date: Option<&str>, source: &str) -> AResult<String> {
-        let path = self.daily_path(date)?;
+        self.ensure_period("day", date, source)
+    }
+
+    /// Like [`ensure_daily`] for day/week/month notes; uses `Templates/Daily|Weekly|Monthly.md`.
+    pub fn ensure_period(&self, period: &str, date: Option<&str>, source: &str) -> AResult<String> {
+        let path = self.period_path(period, date)?;
         if !self.vault.exists(&path) {
             let d = note::stem(&path).to_string();
-            let tpl = format!("{}/Daily.md", self.settings.templates_dir);
+            let tname = match period {
+                "week" => "Weekly",
+                "month" => "Monthly",
+                _ => "Daily",
+            };
+            let tpl = format!("{}/{tname}.md", self.settings.templates_dir);
             let body = match self.vault.exists(&tpl).then(|| self.vault.read(&tpl)) {
                 Some(Ok(t)) => render_template(&t, &d),
                 _ => format!("---\ntags: [journal]\n---\n# {d}\n\n"),

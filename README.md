@@ -37,6 +37,14 @@ One ~10 MB static binary, no database server, no CDN, no telemetry. Runs fine on
 - Edit · split · preview modes, autosave, `[[` autocomplete, list continuation, paste/drop images
 - Full-text search (SQLite FTS5) that ignores diacritics — `seker` finds `şeker` — with `tag:`, `path:` and `"phrase"` filters
 - Force-directed graph (global or around the current note)
+- **Embeds** `![[Note]]`, `![[Note#Heading]]`, `![[Note^block]]` show the content inline; **hover a link** to preview it
+- **Math** (`$…$`, `$$…$$`, KaTeX) and **Mermaid** diagrams — bundled, loaded only when a note uses them
+- **Bases**: a ```` ```base ```` block turns frontmatter into a sortable table, cards or list (see below)
+- **Properties editor**: edit frontmatter as a form
+- **Tasks page**: every `- [ ]` across the vault, grouped into overdue / today / next 7 days / later; Obsidian Tasks syntax (`📅 due`, `⏳ scheduled`, `✅ done`, `⏫` priority); tick them anywhere
+- **Calendar**: month view with your daily notes and due tasks; weekly (`2026-W47`) and monthly (`2026-11`) notes with their own templates
+- **Canvas**: infinite board with text, note and link cards, groups and arrows — saved as [JSON Canvas](https://jsoncanvas.org), so `.canvas` files open in Obsidian too
+- **Share to MindCrab** (Android, installed PWA): share a link, text or image from any app straight into today's journal or a new note
 - Daily notes (`Journal/YYYY-MM-DD.md`) and **templates** (`Templates/`, Obsidian-style `{{title}}`, `{{date}}`, `{{time}}`, `{{date:DD.MM.YYYY}}`) — pick one for a new note or insert it from the toolbar
 - **Semantic search** (optional): finds notes by meaning, not just words — “sunucu” finds a note about your “Oracle makinesi”. Hybrid ranking (keywords + vectors), “related notes” in the side panel. Works with Ollama (fully local), Gemini, OpenAI or any OpenAI-compatible embeddings API
 - **Works offline** (installable PWA): opened notes stay readable without a connection, “download all notes” for the whole vault, edits made offline are kept on the device and synced (with conflict check) when you're back
@@ -50,7 +58,10 @@ One ~10 MB static binary, no database server, no CDN, no telemetry. Runs fine on
 - Surgical edits (`edit_note`, `append_to_note` under a heading) and optimistic locking (`expected_hash`) so an AI never silently overwrites your changes
 - **Every change is versioned** — by you, the web UI, an AI or an external editor — with a diff view and one-click restore
 - Deletes go to `.trash/`, never `rm`
-- Optional read-only MCP mode and a separate MCP token you can rotate without logging yourself out
+- **Hidden from AI**: `ai: false` in a note's frontmatter, or patterns in `.mcpignore` (`Private/`, `Health/**`, `*.secret.md`) — hidden notes behave exactly like notes that don't exist for every AI
+- **Connections**: give each AI its own token, limited to some folders, read-only, and/or with **approval required** for what it remembers; revoke any time
+- **AI activity feed**: every change an AI made, with a diff and one-click undo (also for creates, deletes and moves)
+- **Review & cleanup**: approve/edit/reject remembered facts; find repeated or stale facts in the memory folder (`memory_review` lets the AI tidy up too)
 
 **Design**
 - Material 3 colour roles generated from one seed hue (OKLCH), 8 presets + custom colour + monochrome, light/dark/system
@@ -148,16 +159,26 @@ bearer_token_env_var = "MINDCRAB_TOKEN"
 | `get_links` | Backlinks with context, outgoing links, unlinked mentions |
 | `related_notes` | Notes closest in meaning (semantic search) |
 | `list_tags` | Tags with counts |
-| `daily_note` | Read or append to today's (or any day's) journal |
+| `query_notes` | Database-style query over frontmatter (same engine as bases) |
+| `list_tasks` | Open/done tasks with due dates, filters |
+| `memory_review` | Repeated and old facts to merge or refresh |
+| `daily_note` | Read or append to a day's, week's or month's journal note |
 | `remember` | Save one durable fact to `Memory/<topic>.md` |
 | `write_note` | Create / replace (with `expected_hash`) |
 | `edit_note` | Replace one exact snippet |
 | `append_to_note` | Append to the end or under a heading |
+| `add_task` / `complete_task` | Add a task (with due date) / tick or reopen one |
 | `move_note` | Rename/move a note or folder and fix links |
 | `delete_note` | Move to trash |
 | `note_history` / `restore_revision` | List, read and restore earlier versions |
 
-With `MINDCRAB_MCP_READ_ONLY=true` only the read tools are exposed.
+With `MINDCRAB_MCP_READ_ONLY=true` (or a read-only connection) only the read tools are exposed.
+
+### Privacy and per-AI access
+
+- **Hide notes from all AIs**: add `ai: false` to a note's frontmatter, or list paths in **Settings → Hidden from AI** (stored as `.mcpignore` in the vault, gitignore syntax). Hidden notes never appear in search, links, tags, tasks or queries, and can't be read or changed — they look like they don't exist. A lock icon marks them in the file tree.
+- **Connections** (Settings → Connections): create one token per assistant. Each can be limited to folders (`Projects, Memory`), made read-only, and set to *facts need my approval* — then `remember` lands in **Review** instead of your notes. History shows changes as `mcp:<connection name>`. Delete a connection to revoke it instantly.
+- `MINDCRAB_REVIEW_REMEMBER=true` turns on approval for the main token too.
 
 ### How the memory is organised
 
@@ -173,6 +194,24 @@ vault/
 ```
 
 Edit `MEMORY.md` to tell assistants how *you* want them to use the vault (what to store, where, in which language). The server also sends short instructions on `initialize`.
+
+## Bases (table views)
+
+````markdown
+```base
+from: Books                 # folder (optional)
+tag: book                   # tag (optional)
+where:                      # all must hold
+  - rating >= 4
+  - status != dropped
+  - has author
+columns: [title, author, rating, finished]
+sort: -rating               # "-" = descending
+view: table                 # table | cards | list
+```
+````
+
+Conditions: `=` `!=` `>` `>=` `<` `<=` `contains`, `has field`, `missing field`. Built-in fields: `title`, `path`, `folder`, `name`, `tags`, `modified`. Click a column header to sort. The same query is available to AIs as `query_notes`.
 
 ## Semantic search
 
@@ -219,6 +258,7 @@ All options are flags or environment variables.
 | `MINDCRAB_TOKEN` | generated | Web UI + REST API token (≥ 16 chars) |
 | `MINDCRAB_MCP_TOKEN` | = web token | Separate token for AI clients |
 | `MINDCRAB_MCP_READ_ONLY` | `false` | Expose only read tools |
+| `MINDCRAB_REVIEW_REMEMBER` | `false` | `remember` over the main token waits for approval |
 | `MINDCRAB_COOKIE_SECURE` | `false` | `Secure` cookie (use with HTTPS) |
 | `MINDCRAB_DAILY_DIR` | `Journal` | Daily notes folder |
 | `MINDCRAB_MEMORY_DIR` | `Memory` | Folder for `remember` |
@@ -261,10 +301,11 @@ MindCrab, Rust ile yazılmış, kendi sunucunda çalışan Obsidian benzeri bir 
 2. **Ayarlar → Yapay zekâ bağla** bölümünden uç noktayı ve hazır yapılandırmaları kopyala.
 3. Anlama göre arama için `MINDCRAB_EMBED_URL` ve `MINDCRAB_EMBED_MODEL` ayarla (Gemini ya da Ollama, yukarıdaki örneklere bak). Böylece "sunucu" araması "Oracle makinesi" geçen notu da bulur.
 4. Uygulamayı telefona kur. Açtığın notlar çevrimdışı da okunur; çevrimdışı yaptığın değişiklikler bağlantı gelince kaydedilir.
-5. Asistanlar önce `MEMORY.md` dosyasını okur. Küçük bilgileri `Memory/<Konu>.md` içine tarihli madde olarak kaydeder. Yaptıkları her değişiklik notun **Geçmiş** sekmesinde görünür ve geri alınabilir.
+5. **Ayarlar → Yapay zekâdan gizli** bölümünde istediğin klasörleri gizle (ya da nota `ai: false` yaz). **Bağlantılar** bölümünden her asistana ayrı, klasörle sınırlı ya da onaylı anahtar ver.
+6. Asistanlar önce `MEMORY.md` dosyasını okur. Küçük bilgileri `Memory/<Konu>.md` içine tarihli madde olarak kaydeder. Yaptıkları her değişiklik notun **Geçmiş** sekmesinde görünür ve geri alınabilir.
 
 Notlar düz `.md` dosyalarıdır. Var olan bir Obsidian kasasını da bağlayabilirsin, dışarıdan yapılan değişiklikler canlı olarak algılanır.
 
 ## License
 
-MIT. Bundled: [Material Symbols](https://github.com/google/material-design-icons) (Apache-2.0), [Roboto Flex](https://github.com/googlefonts/roboto-flex) (OFL-1.1, see `web/fonts/OFL.txt`).
+MIT. Bundled: [Material Symbols](https://github.com/google/material-design-icons) (Apache-2.0), [Roboto Flex](https://github.com/googlefonts/roboto-flex) (OFL-1.1, see `web/fonts/OFL.txt`), [KaTeX](https://katex.org) (MIT) and [Mermaid](https://mermaid.js.org) (MIT) — licenses in `web/vendor/`.

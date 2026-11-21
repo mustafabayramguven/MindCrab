@@ -59,6 +59,13 @@ Hoş geldin! Notların düz `.md` dosyaları olarak diskte durur; Obsidian ile d
 
 - Tasks: `- [ ] todo` / `- [x] done`
 
+## More
+
+- **Tasks** and **Calendar** in the sidebar collect every `- [ ] task 📅 2026-12-01` from all notes.
+- A ```` ```base ```` block turns frontmatter into a table — press the table button in the toolbar.
+- `$E=mc^2$` renders as math, ```` ```mermaid ```` blocks as diagrams, and **Canvas** boards live next to your notes.
+- Add `ai: false` to a note's frontmatter to hide it from every AI.
+
 ## Memory
 
 [[MEMORY]] is the entry point AI assistants read first. Facts they save with

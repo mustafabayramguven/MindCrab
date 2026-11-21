@@ -2,6 +2,7 @@
 
 use crate::app::{AResult, App, AppError};
 use crate::mcp::{self, Session};
+use crate::scope::Scope;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -22,6 +23,8 @@ pub struct Config {
     pub web_token: String,
     pub mcp_token: String,
     pub mcp_read_only: bool,
+    /// Default for the main MCP token: `remember` waits for approval.
+    pub mcp_review: bool,
     pub cookie_secure: bool,
 }
 
@@ -89,10 +92,8 @@ where
 
 pub fn router(shared: Arc<Shared>) -> Router {
     let api = Router::new()
-        .route(
-            "/session",
-            get(|| async { Json(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})) }),
-        )
+        .route("/session", get(session_info))
+        .route("/append", post(append))
         .route("/tree", get(tree))
         .route(
             "/note",
@@ -121,6 +122,28 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/upload", post(upload))
         .route("/file/{*path}", get(file))
         .route("/mcp-info", get(mcp_info))
+        .route("/ai-ignore", get(get_ai_ignore).put(put_ai_ignore))
+        .route(
+            "/connections",
+            get(list_connections).post(create_connection),
+        )
+        .route(
+            "/connections/{id}",
+            axum::routing::put(update_connection).delete(delete_connection),
+        )
+        .route("/activity", get(activity))
+        .route("/activity/{id}", get(activity_diff))
+        .route("/activity/{id}/undo", post(activity_undo))
+        .route("/pending", get(pending))
+        .route("/pending/{id}/approve", post(pending_approve))
+        .route("/pending/{id}/reject", post(pending_reject))
+        .route("/tasks", get(tasks).post(add_task))
+        .route("/tasks/toggle", post(toggle_task))
+        .route("/base", post(base_query))
+        .route("/memory-review", get(memory_review))
+        .route("/remove-line", post(remove_line))
+        .route("/preview", get(preview))
+        .route("/canvas", get(get_canvas).put(put_canvas))
         .layer(middleware::from_fn_with_state(shared.clone(), require_auth))
         .route("/login", post(login))
         .route("/logout", post(logout))
@@ -200,7 +223,15 @@ async fn tree(State(st): St) -> ApiResult<Json<Value>> {
         let idx = app.idx();
         let notes = idx.list(None, false, 1_000_000)?;
         let folders = idx.folders()?;
-        Ok(Json(json!({"notes": notes, "folders": folders})))
+        let pending = idx.pending_count()?;
+        drop(idx);
+        Ok(Json(json!({
+            "notes": notes,
+            "folders": folders,
+            "canvases": app.canvases()?,
+            "hidden": app.ai_hidden_paths()?,
+            "pending": pending,
+        })))
     })
     .await
 }
@@ -437,12 +468,13 @@ async fn render(State(st): St, Json(r): Json<RenderReq>) -> ApiResult<Json<Value
 #[derive(Deserialize)]
 struct DailyReq {
     date: Option<String>,
+    period: Option<String>,
 }
 
 async fn daily(State(st): St, Json(r): Json<DailyReq>) -> ApiResult<Json<Value>> {
     run(&st, move |app| {
         Ok(Json(
-            json!({"path": app.ensure_daily(r.date.as_deref(), "web")?}),
+            json!({"path": app.ensure_period(r.period.as_deref().unwrap_or("day"), r.date.as_deref(), "web")?}),
         ))
     })
     .await
@@ -539,9 +571,32 @@ async fn mcp_info(State(st): St, headers: HeaderMap) -> Json<Value> {
 
 // ------------------------------------------------------------------ MCP
 
+/// Main MCP token → full scope; otherwise a named connection's token.
+async fn resolve_scope(st: &Arc<Shared>, token: &str) -> Option<(Scope, bool)> {
+    if eq(token, &st.cfg.mcp_token) {
+        return Some((
+            Scope::full("default", st.cfg.mcp_read_only, st.cfg.mcp_review),
+            false,
+        ));
+    }
+    if !token.starts_with("mcc_") {
+        return None;
+    }
+    let app = st.app.clone();
+    let t = token.to_string();
+    tokio::task::spawn_blocking(move || app.idx().connection_scope(&t).ok().flatten())
+        .await
+        .ok()
+        .flatten()
+        .map(|s| (s, true))
+}
+
 async fn mcp_post(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
-    let ok = bearer(&headers).is_some_and(|t| eq(t, &st.cfg.mcp_token));
-    if !ok {
+    let scope = match bearer(&headers) {
+        Some(t) => resolve_scope(&st, t).await,
+        None => None,
+    };
+    let Some(scope) = scope else {
         let mut r = (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid or missing bearer token"})),
@@ -552,8 +607,8 @@ async fn mcp_post(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
             HeaderValue::from_static("Bearer realm=\"mindcrab\""),
         );
         return r;
-    }
-    mcp_dispatch(st, headers, body).await
+    };
+    mcp_dispatch(st, headers, body, scope).await
 }
 
 async fn mcp_post_path(
@@ -562,14 +617,19 @@ async fn mcp_post_path(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !eq(&token, &st.cfg.mcp_token) {
+    let Some(scope) = resolve_scope(&st, &token).await else {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    mcp_dispatch(st, headers, body).await
+    };
+    mcp_dispatch(st, headers, body, scope).await
 }
 
-async fn mcp_dispatch(st: Arc<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+async fn mcp_dispatch(
+    st: Arc<Shared>,
+    headers: HeaderMap,
+    body: Bytes,
+    (scope, named): (Scope, bool),
+) -> Response {
     let msg: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -596,10 +656,10 @@ async fn mcp_dispatch(st: Arc<Shared>, headers: HeaderMap, body: Bytes) -> Respo
         .as_ref()
         .and_then(|sid| st.sessions.lock().unwrap().get(sid).cloned())
         .unwrap_or(fallback);
-    let read_only = st.cfg.mcp_read_only;
     let app = st.app.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mut session = Session { client, read_only };
+        let mut session = Session::new(scope, named);
+        session.client = client;
         let out = mcp::handle(&app, &mut session, msg);
         (out, session.client)
     })
@@ -647,4 +707,301 @@ async fn mcp_delete(State(st): St, headers: HeaderMap) -> StatusCode {
         st.sessions.lock().unwrap().remove(sid);
     }
     StatusCode::OK
+}
+
+// ------------------------------------------------------------------ privacy & connections
+
+async fn get_ai_ignore(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| {
+        Ok(Json(
+            json!({"text": app.ai_ignore_text(), "hidden": app.ai_hidden_paths()?}),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct TextReq {
+    text: String,
+}
+
+async fn put_ai_ignore(State(st): St, Json(r): Json<TextReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        app.set_ai_ignore(&r.text)?;
+        Ok(Json(json!({"hidden": app.ai_hidden_paths()?})))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ConnReq {
+    name: String,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    review: bool,
+    #[serde(default)]
+    folders: Vec<String>,
+}
+
+async fn list_connections(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| {
+        Ok(Json(json!({"connections": app.connections()?})))
+    })
+    .await
+}
+
+async fn create_connection(State(st): St, Json(r): Json<ConnReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let (id, token) = app.create_connection(&r.name, r.read_only, r.review, &r.folders)?;
+        Ok(Json(json!({"id": id, "token": token})))
+    })
+    .await
+}
+
+async fn update_connection(
+    State(st): St,
+    Path(id): Path<i64>,
+    Json(r): Json<ConnReq>,
+) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        app.update_connection(id, &r.name, r.read_only, r.review, &r.folders)?;
+        Ok(Json(json!({"ok": true})))
+    })
+    .await
+}
+
+async fn delete_connection(State(st): St, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        app.delete_connection(id)?;
+        Ok(Json(json!({"ok": true})))
+    })
+    .await
+}
+
+// ------------------------------------------------------------------ activity & review
+
+#[derive(Deserialize)]
+struct ActivityQ {
+    #[serde(default, deserialize_with = "flag")]
+    all: bool,
+    before: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn activity(State(st): St, Query(q): Query<ActivityQ>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            json!({"items": app.activity(!q.all, q.before, q.limit.unwrap_or(50))?}),
+        ))
+    })
+    .await
+}
+
+async fn activity_diff(State(st): St, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| Ok(Json(app.activity_diff(id)?))).await
+}
+
+async fn activity_undo(State(st): St, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(json!({"path": app.undo_activity(id, "web")?})))
+    })
+    .await
+}
+
+async fn pending(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| Ok(Json(json!({"facts": app.pending_facts()?})))).await
+}
+
+#[derive(Deserialize, Default)]
+struct ApproveReq {
+    fact: Option<String>,
+    topic: Option<String>,
+}
+
+async fn pending_approve(
+    State(st): St,
+    Path(id): Path<i64>,
+    body: Option<Json<ApproveReq>>,
+) -> ApiResult<Json<Value>> {
+    let r = body.map(|b| b.0).unwrap_or_default();
+    run(&st, move |app| {
+        Ok(Json(
+            serde_json::to_value(app.approve_fact(id, r.fact.as_deref(), r.topic.as_deref())?)
+                .unwrap(),
+        ))
+    })
+    .await
+}
+
+async fn pending_reject(State(st): St, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        app.reject_fact(id)?;
+        Ok(Json(json!({"ok": true})))
+    })
+    .await
+}
+
+async fn memory_review(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| Ok(Json(app.memory_review(None)?))).await
+}
+
+#[derive(Deserialize)]
+struct LineReq {
+    path: String,
+    line: usize,
+    raw: String,
+}
+
+async fn remove_line(State(st): St, Json(r): Json<LineReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            serde_json::to_value(app.remove_line(&r.path, r.line, &r.raw, "web")?).unwrap(),
+        ))
+    })
+    .await
+}
+
+// ------------------------------------------------------------------ tasks, bases, previews, canvases
+
+#[derive(Deserialize)]
+struct TasksQ {
+    #[serde(default, deserialize_with = "flag")]
+    done: bool,
+}
+
+/// Accepts `1`, `true`, `yes`, `on` (query-string friendly booleans).
+fn flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(matches!(
+        s.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    ))
+}
+
+async fn tasks(State(st): St, Query(q): Query<TasksQ>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let f = crate::features::TaskFilter {
+            include_done: q.done,
+            ..Default::default()
+        };
+        Ok(Json(json!({"tasks": app.tasks(&f, None)?})))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct AddTaskReq {
+    text: String,
+    due: Option<String>,
+    path: Option<String>,
+}
+
+async fn add_task(State(st): St, Json(r): Json<AddTaskReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            serde_json::to_value(app.add_task(
+                &r.text,
+                r.due.as_deref(),
+                r.path.as_deref(),
+                "web",
+            )?)
+            .unwrap(),
+        ))
+    })
+    .await
+}
+
+async fn toggle_task(State(st): St, Json(r): Json<LineReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            serde_json::to_value(app.toggle_task(&r.path, r.line, &r.raw, "web")?).unwrap(),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct BaseReq {
+    spec: String,
+}
+
+async fn base_query(State(st): St, Json(r): Json<BaseReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let spec = crate::bases::parse_spec(&r.spec).map_err(AppError::BadRequest)?;
+        Ok(Json(
+            serde_json::to_value(app.base_query(&spec, None)?).unwrap(),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct PreviewQ {
+    path: String,
+    anchor: Option<String>,
+}
+
+async fn preview(State(st): St, Query(q): Query<PreviewQ>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let path = app.find_note(&q.path)?;
+        Ok(Json(json!({"path": path, "title": app.title_of(&path), "html": app.preview(&path, q.anchor.as_deref())?})))
+    })
+    .await
+}
+
+async fn get_canvas(State(st): St, Query(q): Query<PathQ>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let text = app.read_canvas(&q.path)?;
+        Ok(Json(
+            serde_json::from_str(&text).unwrap_or_else(|_| json!({"nodes": [], "edges": []})),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct CanvasReq {
+    path: String,
+    content: Value,
+}
+
+async fn put_canvas(State(st): St, Json(r): Json<CanvasReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            json!({"path": app.write_canvas(&r.path, &r.content.to_string(), "web")?}),
+        ))
+    })
+    .await
+}
+
+async fn session_info(State(st): St) -> Json<Value> {
+    let s = &st.app.settings;
+    Json(json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "settings": {
+            "daily_dir": s.daily_dir,
+            "memory_dir": s.memory_dir,
+            "templates_dir": s.templates_dir,
+            "attachments_dir": s.attachments_dir,
+        }
+    }))
+}
+
+#[derive(Deserialize)]
+struct AppendReq {
+    path: String,
+    text: String,
+    heading: Option<String>,
+}
+
+async fn append(State(st): St, Json(r): Json<AppendReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            serde_json::to_value(app.append(&r.path, &r.text, r.heading.as_deref(), "web")?)
+                .unwrap(),
+        ))
+    })
+    .await
 }
