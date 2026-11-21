@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>MindCrab</title>
+  <meta name="theme-color" content="#6b4fa0">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <!-- Login -->
+  <section id="login" class="login" hidden>
+    <form class="login-card" id="login-form">
+      <img src="/icon.svg" alt="" width="72" height="72">
+      <h1 class="display-small">MindCrab</h1>
+      <p class="body-medium muted" data-i18n="login.subtitle"></p>
+      <label class="text-field">
+        <input id="login-token" type="password" autocomplete="current-password" required placeholder=" ">
+        <span data-i18n="login.token"></span>
+      </label>
+      <p id="login-error" class="error-text body-small" hidden></p>
+      <button class="btn filled" type="submit" data-i18n="login.submit"></button>
+      <p class="body-small muted" data-i18n="login.hint"></p>
+    </form>
+  </section>
+
+  <!-- App -->
+  <div id="app" class="app" hidden>
+    <div class="scrim" id="scrim"></div>
+
+    <nav class="drawer" id="drawer">
+      <div class="drawer-head">
+        <img src="/icon.svg" alt="" width="32" height="32">
+        <span class="title-large">MindCrab</span>
+      </div>
+      <button class="search-bar" id="open-search" type="button">
+        <i data-icon="search"></i><span data-i18n="search.placeholder"></span><kbd>Ctrl K</kbd>
+      </button>
+      <div class="drawer-actions">
+        <button class="btn fab-extended" id="new-note" type="button"><i data-icon="edit_note"></i><span data-i18n="action.newNote"></span></button>
+        <button class="icon-btn tonal" id="new-folder" type="button" data-i18n-title="action.newFolder"><i data-icon="create_new_folder"></i></button>
+        <button class="icon-btn tonal" id="open-daily" type="button" data-i18n-title="action.daily"><i data-icon="today"></i></button>
+      </div>
+      <div class="drawer-scroll">
+        <div class="section-label label-large" data-i18n="nav.files"></div>
+        <ul class="tree" id="tree" role="tree"></ul>
+        <details class="tags-block" id="tags-block">
+          <summary class="section-label label-large"><span data-i18n="nav.tags"></span><i data-icon="keyboard_arrow_down"></i></summary>
+          <div class="chips" id="tag-list"></div>
+        </details>
+      </div>
+      <div class="drawer-foot">
+        <button class="nav-item" id="nav-graph" type="button"><i data-icon="hub"></i><span data-i18n="nav.graph"></span></button>
+        <button class="nav-item" id="nav-settings" type="button"><i data-icon="settings"></i><span data-i18n="nav.settings"></span></button>
+      </div>
+    </nav>
+
+    <main class="main">
+      <header class="top-bar">
+        <button class="icon-btn" id="toggle-drawer" type="button" data-i18n-title="action.menu"><i data-icon="menu"></i></button>
+        <div class="top-title">
+          <div class="crumbs label-medium" id="crumbs"></div>
+          <div class="title-large note-title" id="note-title"></div>
+        </div>
+        <span class="save-state label-medium" id="save-state"></span>
+        <div class="segmented" id="mode-switch" role="group">
+          <button type="button" data-mode="edit" data-i18n-title="mode.edit"><i data-icon="edit"></i></button>
+          <button type="button" data-mode="split" data-i18n-title="mode.split" class="hide-mobile"><i data-icon="vertical_split"></i></button>
+          <button type="button" data-mode="preview" data-i18n-title="mode.preview"><i data-icon="visibility"></i></button>
+        </div>
+        <button class="icon-btn" id="toggle-panel" type="button" data-i18n-title="action.panel"><i data-icon="right_panel_open"></i></button>
+        <button class="icon-btn" id="note-menu" type="button" data-i18n-title="action.more"><i data-icon="more_vert"></i></button>
+      </header>
+
+      <div class="content" id="content">
+        <!-- Note view -->
+        <section class="note-view" id="note-view" hidden>
+          <div class="toolbar" id="toolbar">
+            <button type="button" data-fmt="bold" data-i18n-title="fmt.bold"><i data-icon="format_bold"></i></button>
+            <button type="button" data-fmt="italic" data-i18n-title="fmt.italic"><i data-icon="format_italic"></i></button>
+            <button type="button" data-fmt="heading" data-i18n-title="fmt.heading"><i data-icon="title"></i></button>
+            <button type="button" data-fmt="list" data-i18n-title="fmt.list"><i data-icon="format_list_bulleted"></i></button>
+            <button type="button" data-fmt="task" data-i18n-title="fmt.task"><i data-icon="checklist"></i></button>
+            <button type="button" data-fmt="quote" data-i18n-title="fmt.quote"><i data-icon="format_quote"></i></button>
+            <button type="button" data-fmt="code" data-i18n-title="fmt.code"><i data-icon="code"></i></button>
+            <button type="button" data-fmt="wikilink" data-i18n-title="fmt.wikilink"><i data-icon="add_link"></i></button>
+            <button type="button" data-fmt="tag" data-i18n-title="fmt.tag"><i data-icon="tag"></i></button>
+            <button type="button" data-fmt="attach" data-i18n-title="fmt.attach"><i data-icon="attach_file"></i></button>
+            <input type="file" id="file-input" hidden multiple>
+          </div>
+          <div class="panes" id="panes">
+            <div class="editor-wrap">
+              <textarea id="editor" class="editor" spellcheck="false" autocapitalize="sentences"></textarea>
+            </div>
+            <article class="preview markdown" id="preview"></article>
+          </div>
+        </section>
+
+        <!-- List view (tags, search results) -->
+        <section class="list-view" id="list-view" hidden>
+          <h2 class="headline-small" id="list-title"></h2>
+          <div class="cards" id="list-items"></div>
+        </section>
+
+        <!-- Graph -->
+        <section class="graph-view" id="graph-view" hidden>
+          <canvas id="graph-canvas"></canvas>
+          <div class="graph-controls">
+            <label class="switch-row label-large"><input type="checkbox" id="graph-local"><span class="switch"></span><span data-i18n="graph.local"></span></label>
+            <label class="switch-row label-large"><input type="checkbox" id="graph-orphans" checked><span class="switch"></span><span data-i18n="graph.orphans"></span></label>
+          </div>
+        </section>
+
+        <!-- Empty -->
+        <section class="empty-view" id="empty-view" hidden>
+          <i data-icon="psychology" class="huge"></i>
+          <p class="title-medium" data-i18n="empty.title"></p>
+          <p class="body-medium muted" data-i18n="empty.body"></p>
+        </section>
+      </div>
+    </main>
+
+    <aside class="side-panel" id="side-panel">
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" data-tab="links" class="active"><i data-icon="link"></i><span data-i18n="panel.links"></span></button>
+        <button type="button" role="tab" data-tab="history"><i data-icon="history"></i><span data-i18n="panel.history"></span></button>
+        <button type="button" role="tab" data-tab="info"><i data-icon="info"></i><span data-i18n="panel.info"></span></button>
+        <button class="icon-btn close-panel" id="close-panel" type="button"><i data-icon="close"></i></button>
+      </div>
+      <div class="panel-body" id="panel-body"></div>
+    </aside>
+
+    <button class="fab" id="fab" type="button" data-i18n-title="action.newNote"><i data-icon="edit_note"></i></button>
+  </div>
+
+  <!-- Wikilink autocomplete -->
+  <div class="menu suggest" id="suggest" hidden></div>
+  <!-- Generic menu -->
+  <div class="menu" id="menu" hidden></div>
+  <!-- Snackbar -->
+  <div class="snackbar" id="snackbar" hidden></div>
+
+  <!-- Search dialog -->
+  <dialog class="dialog search-dialog" id="search-dialog">
+    <div class="search-head">
+      <i data-icon="search"></i>
+      <input id="search-input" type="search" autocomplete="off" data-i18n-placeholder="search.placeholder">
+      <button class="icon-btn" type="button" data-close><i data-icon="close"></i></button>
+    </div>
+    <div class="search-hint body-small muted" data-i18n="search.hint"></div>
+    <ul class="search-results" id="search-results"></ul>
+  </dialog>
+
+  <!-- Prompt / confirm dialog -->
+  <dialog class="dialog basic" id="prompt-dialog">
+    <form method="dialog" id="prompt-form">
+      <h2 class="headline-small" id="prompt-title"></h2>
+      <p class="body-medium muted" id="prompt-text"></p>
+      <label class="text-field" id="prompt-field">
+        <input id="prompt-input" autocomplete="off" placeholder=" ">
+        <span id="prompt-label"></span>
+      </label>
+      <div class="dialog-actions">
+        <button class="btn text" value="cancel" type="submit" formnovalidate data-i18n="action.cancel"></button>
+        <button class="btn filled" value="ok" type="submit" id="prompt-ok"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Revision viewer -->
+  <dialog class="dialog large" id="revision-dialog">
+    <div class="dialog-head">
+      <h2 class="headline-small" id="revision-title"></h2>
+      <button class="icon-btn" type="button" data-close><i data-icon="close"></i></button>
+    </div>
+    <pre class="revision-diff" id="revision-body"></pre>
+    <div class="dialog-actions">
+      <button class="btn text" type="button" data-close data-i18n="action.close"></button>
+      <button class="btn filled" type="button" id="revision-restore"><i data-icon="settings_backup_restore"></i><span data-i18n="history.restore"></span></button>
+    </div>
+  </dialog>
+
+  <!-- Settings -->
+  <dialog class="dialog large" id="settings-dialog">
+    <div class="dialog-head">
+      <h2 class="headline-small" data-i18n="nav.settings"></h2>
+      <button class="icon-btn" type="button" data-close><i data-icon="close"></i></button>
+    </div>
+    <div class="settings-body">
+      <h3 class="title-medium"><i data-icon="palette"></i><span data-i18n="settings.appearance"></span></h3>
+      <div class="segmented wide" id="theme-switch" role="group">
+        <button type="button" data-theme="system"><i data-icon="contrast"></i><span data-i18n="settings.system"></span></button>
+        <button type="button" data-theme="light"><i data-icon="light_mode"></i><span data-i18n="settings.light"></span></button>
+        <button type="button" data-theme="dark"><i data-icon="dark_mode"></i><span data-i18n="settings.dark"></span></button>
+      </div>
+      <p class="label-large" data-i18n="settings.color"></p>
+      <div class="swatches" id="swatches"></div>
+      <label class="switch-row label-large"><input type="checkbox" id="opt-wide"><span class="switch"></span><span data-i18n="settings.wide"></span></label>
+      <label class="switch-row label-large"><input type="checkbox" id="opt-spell"><span class="switch"></span><span data-i18n="settings.spell"></span></label>
+
+      <h3 class="title-medium"><i data-icon="smart_toy"></i><span data-i18n="settings.mcp"></span></h3>
+      <p class="body-medium muted" data-i18n="settings.mcpIntro"></p>
+      <div id="mcp-info"></div>
+
+      <h3 class="title-medium"><i data-icon="key"></i><span data-i18n="settings.session"></span></h3>
+      <button class="btn outlined" id="logout" type="button"><i data-icon="logout"></i><span data-i18n="settings.logout"></span></button>
+      <p class="body-small muted" id="version"></p>
+    </div>
+  </dialog>
+</body>
+</html>

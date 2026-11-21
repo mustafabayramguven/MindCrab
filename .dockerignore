@@ -1,0 +1,6 @@
+target
+vault
+.git
+.github
+*.md
+!web/**

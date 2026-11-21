@@ -1,0 +1,23 @@
+services:
+  mindcrab:
+    image: ghcr.io/mustafabayramguven/mindcrab:latest
+    # build: .            # or build locally from this repo
+    container_name: mindcrab
+    restart: unless-stopped
+    ports:
+      - "3436:3436"
+    volumes:
+      # Your Markdown notes. Point this at an existing Obsidian vault if you like.
+      - ./vault:/data/vault
+    environment:
+      TZ: Europe/Istanbul
+      # Login token for the web UI / REST API. Leave empty to auto-generate one
+      # (printed in `docker logs mindcrab` and saved in vault/.mindcrab/mindcrab_token).
+      MINDCRAB_TOKEN: ${MINDCRAB_TOKEN:-}
+      # Optional separate token for AI clients (MCP) so you can revoke them independently.
+      MINDCRAB_MCP_TOKEN: ${MINDCRAB_MCP_TOKEN:-}
+      # MINDCRAB_MCP_READ_ONLY: "true"
+      # Set to "true" when served over HTTPS (reverse proxy).
+      MINDCRAB_COOKIE_SECURE: ${MINDCRAB_COOKIE_SECURE:-false}
+    # Match the owner of ./vault on the host (id -u / id -g).
+    user: "1000:1000"
