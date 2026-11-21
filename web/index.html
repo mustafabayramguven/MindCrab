@@ -75,6 +75,7 @@
         <button class="icon-btn" id="note-menu" type="button" data-i18n-title="action.more"><i data-icon="more_vert"></i></button>
       </header>
 
+      <div class="offline-banner" id="offline-banner" hidden><i data-icon="cloud_off"></i><span data-i18n="offline.banner"></span></div>
       <div class="content" id="content">
         <!-- Note view -->
         <section class="note-view" id="note-view" hidden>
@@ -88,6 +89,7 @@
             <button type="button" data-fmt="code" data-i18n-title="fmt.code"><i data-icon="code"></i></button>
             <button type="button" data-fmt="wikilink" data-i18n-title="fmt.wikilink"><i data-icon="add_link"></i></button>
             <button type="button" data-fmt="tag" data-i18n-title="fmt.tag"><i data-icon="tag"></i></button>
+            <button type="button" data-fmt="template" data-i18n-title="fmt.template"><i data-icon="note_stack"></i></button>
             <button type="button" data-fmt="attach" data-i18n-title="fmt.attach"><i data-icon="attach_file"></i></button>
             <input type="file" id="file-input" hidden multiple>
           </div>
@@ -163,6 +165,10 @@
         <input id="prompt-input" autocomplete="off" placeholder=" ">
         <span id="prompt-label"></span>
       </label>
+      <label class="select-field" id="prompt-select-wrap" hidden>
+        <span class="label-medium muted" id="prompt-select-label"></span>
+        <select id="prompt-select"></select>
+      </label>
       <div class="dialog-actions">
         <button class="btn text" value="cancel" type="submit" formnovalidate data-i18n="action.cancel"></button>
         <button class="btn filled" value="ok" type="submit" id="prompt-ok"></button>
@@ -204,6 +210,17 @@
       <h3 class="title-medium"><i data-icon="smart_toy"></i><span data-i18n="settings.mcp"></span></h3>
       <p class="body-medium muted" data-i18n="settings.mcpIntro"></p>
       <div id="mcp-info"></div>
+
+      <h3 class="title-medium"><i data-icon="neurology"></i><span data-i18n="settings.semantic"></span></h3>
+      <div id="semantic-info" class="body-medium"></div>
+
+      <h3 class="title-medium"><i data-icon="offline_pin"></i><span data-i18n="settings.offline"></span></h3>
+      <p class="body-medium muted" data-i18n="settings.offlineIntro"></p>
+      <div class="row-actions">
+        <button class="btn tonal" id="offline-download" type="button"><i data-icon="download"></i><span data-i18n="settings.offlineDownload"></span></button>
+        <button class="btn text" id="offline-clear" type="button"><i data-icon="delete_sweep"></i><span data-i18n="settings.offlineClear"></span></button>
+      </div>
+      <p class="body-small muted" id="offline-status"></p>
 
       <h3 class="title-medium"><i data-icon="key"></i><span data-i18n="settings.session"></span></h3>
       <button class="btn outlined" id="logout" type="button"><i data-icon="logout"></i><span data-i18n="settings.logout"></span></button>

@@ -51,6 +51,7 @@ Hoş geldin! Notların düz `.md` dosyaları olarak diskte durur; Obsidian ile d
 - `[[Note name]]` links notes; `[[Note|label]]` changes the label; `[[Note#Heading]]` jumps to a heading.
 - `#tag` or `tags:` in frontmatter groups notes. Nested tags work: `#project/mindcrab`.
 - `![[image.png]]` embeds an image — paste or drop images into the editor.
+- Notes in `Templates/` are templates: pick one when creating a note, or insert it with the toolbar. `{{title}}`, `{{date}}`, `{{time}}` and `{{date:DD.MM.YYYY}}` are filled in. `Templates/Daily.md` shapes the daily note.
 - Callouts:
 
 > [!TIP]
@@ -66,3 +67,8 @@ Every change — by you or by an AI — is kept in the note's **history**.
 
 #mindcrab
 "#;
+
+pub const TEMPLATE_DAILY: &str =
+    "---\ntags: [journal]\n---\n# {{title}}\n\n## Plan\n\n- [ ] \n\n## Log\n\n";
+
+pub const TEMPLATE_MEETING: &str = "---\ntags: [meeting]\ndate: {{date}}\n---\n# {{title}}\n\n**When:** {{date:dddd, D MMMM YYYY}} {{time}}\n**With:** \n\n## Notes\n\n## Decisions\n\n## Action items\n\n- [ ] \n";

@@ -1,4 +1,5 @@
 mod app;
+mod embed;
 mod index;
 mod mcp;
 mod note;
@@ -64,6 +65,61 @@ struct Cli {
         global = true
     )]
     memory_dir: String,
+    #[arg(
+        long,
+        env = "MINDCRAB_TEMPLATES_DIR",
+        default_value = "Templates",
+        global = true
+    )]
+    templates_dir: String,
+    /// OpenAI-compatible embeddings API base URL, enables semantic search.
+    /// e.g. http://ollama:11434/v1 or https://generativelanguage.googleapis.com/v1beta/openai
+    #[arg(long, env = "MINDCRAB_EMBED_URL", global = true)]
+    embed_url: Option<String>,
+    #[arg(
+        long,
+        env = "MINDCRAB_EMBED_KEY",
+        hide_env_values = true,
+        global = true
+    )]
+    embed_key: Option<String>,
+    /// Embedding model name, e.g. nomic-embed-text, bge-m3, gemini-embedding-001.
+    #[arg(long, env = "MINDCRAB_EMBED_MODEL", global = true)]
+    embed_model: Option<String>,
+    /// Text prepended to search queries (e.g. "search_query: " for nomic-embed-text).
+    #[arg(
+        long,
+        env = "MINDCRAB_EMBED_QUERY_PREFIX",
+        default_value = "",
+        global = true
+    )]
+    embed_query_prefix: String,
+    /// Text prepended to note chunks (e.g. "search_document: " for nomic-embed-text).
+    #[arg(
+        long,
+        env = "MINDCRAB_EMBED_DOC_PREFIX",
+        default_value = "",
+        global = true
+    )]
+    embed_doc_prefix: String,
+    /// Optional output dimensions (only for APIs that support "dimensions").
+    #[arg(long, env = "MINDCRAB_EMBED_DIMS", global = true)]
+    embed_dims: Option<usize>,
+    #[arg(
+        long,
+        env = "MINDCRAB_EMBED_BATCH",
+        default_value_t = 32,
+        global = true
+    )]
+    embed_batch: usize,
+    /// Minimum cosine similarity for semantic hits (model dependent; 0 = only relative cut-off).
+    #[arg(
+        long,
+        env = "MINDCRAB_EMBED_MIN_SCORE",
+        default_value_t = 0.0,
+        global = true
+    )]
+    embed_min_score: f32,
     /// Don't create starter notes in an empty vault.
     #[arg(long, env = "MINDCRAB_NO_SEED", global = true)]
     no_seed: bool,
@@ -96,7 +152,28 @@ fn main() -> Result<()> {
     let settings = Settings {
         daily_dir: cli.daily_dir.clone(),
         memory_dir: cli.memory_dir.clone(),
+        templates_dir: cli.templates_dir.trim_matches('/').to_string(),
         ..Default::default()
+    };
+    let embedder = match (
+        cli.embed_url.as_deref().filter(|u| !u.trim().is_empty()),
+        cli.embed_model.as_deref().filter(|m| !m.trim().is_empty()),
+    ) {
+        (Some(url), Some(model)) => {
+            let mut c = embed::EmbedConfig::new(url, cli.embed_key.clone(), model);
+            c.query_prefix = cli.embed_query_prefix.clone();
+            c.doc_prefix = cli.embed_doc_prefix.clone();
+            c.dims = cli.embed_dims;
+            c.batch = cli.embed_batch.clamp(1, 256);
+            c.min_score = cli.embed_min_score;
+            Some(embed::Embedder::new(c))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            anyhow::bail!(
+                "set both MINDCRAB_EMBED_URL and MINDCRAB_EMBED_MODEL to enable semantic search"
+            )
+        }
+        _ => None,
     };
     if matches!(cli.cmd, Some(Cmd::Reindex)) {
         // Re-reads every file; revisions are kept.
@@ -106,7 +183,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let app = Arc::new(App::open(&cli.vault, cli.data.clone(), settings)?);
+    let app = Arc::new(App::open(&cli.vault, cli.data.clone(), settings)?.with_embedder(embedder));
+    if app.semantic_enabled() && !matches!(cli.cmd, Some(Cmd::Token)) {
+        app.set_waker(embed::spawn_worker(app.clone()));
+    }
     let (web_token, web_new) =
         app::ensure_token(&app.data_dir, cli.token.clone(), "MINDCRAB_TOKEN")?;
     let mcp_token = match cli.mcp_token.clone().filter(|t| !t.trim().is_empty()) {

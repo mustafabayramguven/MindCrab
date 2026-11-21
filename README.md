@@ -21,7 +21,7 @@ A self-hosted, Obsidian-style Markdown notebook written in Rust — with a built
 Your notes are plain `.md` files in a folder you own. MindCrab gives that folder:
 
 - a fast **Material You** web app (desktop + phone, installable as a PWA),
-- a **full-text index** with backlinks, tags and a graph,
+- a **full-text index** with backlinks, tags and a graph — plus optional **semantic search** (search by meaning),
 - an **MCP endpoint** with memory-focused tools, so every AI you use reads from and writes to the *same* memory — and you can see, edit and undo everything it wrote.
 
 One ~10 MB static binary, no database server, no CDN, no telemetry. Runs fine on a 1 GB VPS.
@@ -30,19 +30,22 @@ One ~10 MB static binary, no database server, no CDN, no telemetry. Runs fine on
 
 **Notebook (Obsidian-compatible)**
 - `[[Wikilinks]]`, `[[Note|alias]]`, `[[Note#Heading]]`, embeds `![[image.png]]`, relative Markdown links
-- Rename / move a note → every link pointing at it is rewritten
+- Rename / move a note **or a whole folder** → every link pointing at the moved notes is rewritten
 - Backlinks with context, outgoing links (missing ones are one click to create), **unlinked mentions**
 - `#tags`, nested `#tags/like/this` and YAML frontmatter `tags:`
 - GitHub/Obsidian callouts (`> [!TIP]`), tables, footnotes, task lists (tick them in preview)
 - Edit · split · preview modes, autosave, `[[` autocomplete, list continuation, paste/drop images
 - Full-text search (SQLite FTS5) that ignores diacritics — `seker` finds `şeker` — with `tag:`, `path:` and `"phrase"` filters
 - Force-directed graph (global or around the current note)
-- Daily notes (`Journal/YYYY-MM-DD.md`)
+- Daily notes (`Journal/YYYY-MM-DD.md`) and **templates** (`Templates/`, Obsidian-style `{{title}}`, `{{date}}`, `{{time}}`, `{{date:DD.MM.YYYY}}`) — pick one for a new note or insert it from the toolbar
+- **Semantic search** (optional): finds notes by meaning, not just words — “sunucu” finds a note about your “Oracle makinesi”. Hybrid ranking (keywords + vectors), “related notes” in the side panel. Works with Ollama (fully local), Gemini, OpenAI or any OpenAI-compatible embeddings API
+- **Works offline** (installable PWA): opened notes stay readable without a connection, “download all notes” for the whole vault, edits made offline are kept on the device and synced (with conflict check) when you're back
 - Works on an **existing Obsidian vault**; edits made in Obsidian, Syncthing, git or any editor are picked up live (inotify + periodic rescan)
 
 **Memory for AI**
 - MCP over Streamable HTTP (`/mcp`) *and* stdio (`mindcrab mcp`)
 - `memory_overview` → the assistant reads your `MEMORY.md` guide, memory topics, recent notes and tags first
+- `search_notes` uses keywords **and meaning** when semantic search is on; `related_notes` surfaces notes the user never linked
 - `remember` → appends a dated fact to `Memory/<Topic>.md`, tagged with which AI wrote it
 - Surgical edits (`edit_note`, `append_to_note` under a heading) and optimistic locking (`expected_hash`) so an AI never silently overwrites your changes
 - **Every change is versioned** — by you, the web UI, an AI or an external editor — with a diff view and one-click restore
@@ -139,17 +142,18 @@ bearer_token_env_var = "MINDCRAB_TOKEN"
 | Tool | What it does |
 |---|---|
 | `memory_overview` | `MEMORY.md`, memory topics, recently changed notes, top tags — call first |
-| `search_notes` | Ranked full-text search with snippets; `tag:`, `path:`, `"phrase"` |
+| `search_notes` | Ranked search (keywords + meaning) with snippets; `tag:`, `path:`, `"phrase"`; `mode` = auto/keyword/semantic |
 | `read_note` | Full Markdown + hash + backlinks (accepts a path, name or title) |
 | `list_notes` | By folder, alphabetical or most recent |
 | `get_links` | Backlinks with context, outgoing links, unlinked mentions |
+| `related_notes` | Notes closest in meaning (semantic search) |
 | `list_tags` | Tags with counts |
 | `daily_note` | Read or append to today's (or any day's) journal |
 | `remember` | Save one durable fact to `Memory/<topic>.md` |
 | `write_note` | Create / replace (with `expected_hash`) |
 | `edit_note` | Replace one exact snippet |
 | `append_to_note` | Append to the end or under a heading |
-| `move_note` | Rename/move and fix links |
+| `move_note` | Rename/move a note or folder and fix links |
 | `delete_note` | Move to trash |
 | `note_history` / `restore_revision` | List, read and restore earlier versions |
 
@@ -170,6 +174,39 @@ vault/
 
 Edit `MEMORY.md` to tell assistants how *you* want them to use the vault (what to store, where, in which language). The server also sends short instructions on `initialize`.
 
+## Semantic search
+
+Off by default. Point MindCrab at any OpenAI-compatible `/embeddings` endpoint and it chunks every note, embeds the chunks in the background (only changed chunks are re-embedded) and fuses vector hits with keyword hits. Without it everything else works the same.
+
+**Gemini** (free tier, good multilingual quality — fine for a small VPS):
+
+```yaml
+      MINDCRAB_EMBED_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      MINDCRAB_EMBED_MODEL: gemini-embedding-001
+      MINDCRAB_EMBED_KEY: <your Gemini API key>
+      MINDCRAB_EMBED_DIMS: "768"          # optional, smaller vectors
+```
+
+**Ollama** (fully local — needs a machine with ~1 GB free RAM for the model):
+
+```sh
+ollama pull embeddinggemma      # multilingual; or bge-m3, qwen3-embedding, nomic-embed-text
+```
+```yaml
+      MINDCRAB_EMBED_URL: http://ollama:11434/v1
+      MINDCRAB_EMBED_MODEL: embeddinggemma
+      # nomic-embed-text needs prefixes:
+      # MINDCRAB_EMBED_QUERY_PREFIX: "search_query: "
+      # MINDCRAB_EMBED_DOC_PREFIX: "search_document: "
+```
+
+Changing the model re-embeds the vault automatically. Progress and errors are shown in **Settings → Semantic search**; if the API is down, search quietly falls back to keywords. Note text is sent to the embeddings provider you configure — use Ollama if it must stay on your hardware.
+
+## Offline
+
+Install MindCrab as an app (browser menu → *Install* / *Add to Home screen*). Needs HTTPS (or `localhost`).
+Notes you open are cached on the device; **Settings → Offline → Download all notes** caches the whole vault. Edits made offline are stored locally, survive reloads, and are saved when the connection returns — if the note changed elsewhere meanwhile you choose which version wins (the other one stays in History). *Sign out* clears the device cache.
+
 ## Configuration
 
 All options are flags or environment variables.
@@ -185,6 +222,14 @@ All options are flags or environment variables.
 | `MINDCRAB_COOKIE_SECURE` | `false` | `Secure` cookie (use with HTTPS) |
 | `MINDCRAB_DAILY_DIR` | `Journal` | Daily notes folder |
 | `MINDCRAB_MEMORY_DIR` | `Memory` | Folder for `remember` |
+| `MINDCRAB_TEMPLATES_DIR` | `Templates` | Template notes (`Daily.md` shapes daily notes) |
+| `MINDCRAB_EMBED_URL` | – | OpenAI-compatible embeddings base URL (enables semantic search) |
+| `MINDCRAB_EMBED_MODEL` | – | Embedding model name |
+| `MINDCRAB_EMBED_KEY` | – | API key (Bearer), if the provider needs one |
+| `MINDCRAB_EMBED_DIMS` | – | Output dimensions, for APIs that support it |
+| `MINDCRAB_EMBED_QUERY_PREFIX` / `_DOC_PREFIX` | – | Prefixes some models expect |
+| `MINDCRAB_EMBED_MIN_SCORE` | `0` | Minimum cosine similarity for semantic hits |
+| `MINDCRAB_EMBED_BATCH` | `32` | Chunks per embeddings request |
 | `MINDCRAB_NO_SEED` | `false` | Don't create starter notes in an empty vault |
 | `RUST_LOG` | `mindcrab=info` | Log level |
 
@@ -214,7 +259,9 @@ MindCrab, Rust ile yazılmış, kendi sunucunda çalışan Obsidian benzeri bir 
 
 1. `docker compose up -d` ile başlat ve `http://sunucu:3436` adresine gir. Anahtar `MINDCRAB_TOKEN` içindedir; boş bırakırsan logda görünür.
 2. **Ayarlar → Yapay zekâ bağla** bölümünden uç noktayı ve hazır yapılandırmaları kopyala.
-3. Asistanlar önce `MEMORY.md` dosyasını okur. Küçük bilgileri `Memory/<Konu>.md` içine tarihli madde olarak kaydeder. Yaptıkları her değişiklik notun **Geçmiş** sekmesinde görünür ve geri alınabilir.
+3. Anlama göre arama için `MINDCRAB_EMBED_URL` ve `MINDCRAB_EMBED_MODEL` ayarla (Gemini ya da Ollama, yukarıdaki örneklere bak). Böylece "sunucu" araması "Oracle makinesi" geçen notu da bulur.
+4. Uygulamayı telefona kur. Açtığın notlar çevrimdışı da okunur; çevrimdışı yaptığın değişiklikler bağlantı gelince kaydedilir.
+5. Asistanlar önce `MEMORY.md` dosyasını okur. Küçük bilgileri `Memory/<Konu>.md` içine tarihli madde olarak kaydeder. Yaptıkları her değişiklik notun **Geçmiş** sekmesinde görünür ve geri alınabilir.
 
 Notlar düz `.md` dosyalarıdır. Var olan bir Obsidian kasasını da bağlayabilirsin, dışarıdan yapılan değişiklikler canlı olarak algılanır.
 

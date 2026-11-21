@@ -15,6 +15,8 @@ const MAX_REVISIONS_PER_NOTE: i64 = 100;
 
 pub struct Index {
     conn: Connection,
+    /// Bumped whenever stored vectors may have changed (for the in-memory vector cache).
+    pub vec_gen: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +36,9 @@ pub struct SearchHit {
     pub snippet: String,
     pub tags: Vec<String>,
     pub mtime: i64,
+    /// Found by meaning (vector search) rather than by words.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub semantic: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,9 +145,19 @@ impl Index {
                 source TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS revisions_path ON revisions(path, id);
+            CREATE TABLE IF NOT EXISTS chunks(
+                path TEXT NOT NULL REFERENCES notes(path) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                text TEXT NOT NULL,
+                vec BLOB,
+                PRIMARY KEY(path, idx)
+            );
+            CREATE INDEX IF NOT EXISTS chunks_pending ON chunks(path) WHERE vec IS NULL;
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             "#,
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, vec_gen: 0 })
     }
 
     pub fn note_state(&self, path: &str) -> Result<Option<(String, i64, i64)>> {
@@ -215,8 +230,33 @@ impl Index {
             for t in &p.tags {
                 ins.execute(params![path, t])?;
             }
+            // Chunks for semantic search: keep vectors of unchanged chunks.
+            let chunks = crate::embed::chunk(&p.title, &p.body);
+            let mut old_hashes: HashMap<i64, String> = HashMap::new();
+            let mut q = tx.prepare("SELECT idx, hash FROM chunks WHERE path=?1")?;
+            for row in q.query_map([path], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (i, h) = row?;
+                old_hashes.insert(i, h);
+            }
+            let mut put = tx.prepare(
+                "INSERT INTO chunks(path,idx,hash,text,vec) VALUES(?1,?2,?3,?4,NULL)
+                 ON CONFLICT(path,idx) DO UPDATE SET hash=?3, text=?4, vec=NULL",
+            )?;
+            for (i, c) in chunks.iter().enumerate() {
+                let h = hash(c);
+                if old_hashes.get(&(i as i64)) != Some(&h) {
+                    put.execute(params![path, i as i64, h, c])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM chunks WHERE path=?1 AND idx>=?2",
+                params![path, chunks.len() as i64],
+            )?;
         }
         tx.commit()?;
+        self.vec_gen += 1;
         Ok(true)
     }
 
@@ -239,6 +279,7 @@ impl Index {
         tx.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
         tx.execute("DELETE FROM notes WHERE path=?1", [path])?;
         tx.commit()?;
+        self.vec_gen += 1;
         Ok(())
     }
 
@@ -394,6 +435,7 @@ impl Index {
                         snippet: String::new(),
                         tags: m.tags,
                         mtime: m.mtime,
+                        semantic: false,
                     });
                     if hits.len() >= limit {
                         break;
@@ -435,6 +477,7 @@ impl Index {
                 snippet,
                 tags: t,
                 mtime,
+                semantic: false,
             });
             if hits.len() >= limit {
                 break;
@@ -586,6 +629,108 @@ impl Index {
         })
     }
 
+    // ------------------------------------------------------------ vectors
+
+    /// Records which embedding model the stored vectors belong to; wipes them if it changed.
+    pub fn ensure_vector_space(&mut self, fingerprint: &str) -> Result<bool> {
+        let cur: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='vector_space'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if cur.as_deref() == Some(fingerprint) {
+            return Ok(false);
+        }
+        self.conn.execute("UPDATE chunks SET vec=NULL", [])?;
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('vector_space',?1) ON CONFLICT(key) DO UPDATE SET value=?1",
+            [fingerprint],
+        )?;
+        self.vec_gen += 1;
+        Ok(cur.is_some())
+    }
+
+    /// Chunks that still need a vector: (path, idx, hash, text).
+    pub fn pending_chunks(&self, limit: usize) -> Result<Vec<(String, i64, String, String)>> {
+        let mut st = self.conn.prepare("SELECT path, idx, hash, text FROM chunks WHERE vec IS NULL ORDER BY path, idx LIMIT ?1")?;
+        Ok(st
+            .query_map([limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Stores vectors; rows whose chunk changed meanwhile (hash mismatch) are skipped.
+    pub fn store_vectors(&mut self, rows: &[(String, i64, String, Vec<f32>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut st =
+                tx.prepare("UPDATE chunks SET vec=?4 WHERE path=?1 AND idx=?2 AND hash=?3")?;
+            for (p, i, h, v) in rows {
+                st.execute(params![p, i, h, crate::embed::to_blob(v)])?;
+            }
+        }
+        tx.commit()?;
+        self.vec_gen += 1;
+        Ok(())
+    }
+
+    /// (chunks with a vector, all chunks)
+    pub fn embed_stats(&self) -> Result<(i64, i64)> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(vec), COUNT(*) FROM chunks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
+    }
+
+    pub fn load_vectors(&self) -> Result<Vec<(String, i64, Vec<f32>)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT path, idx, vec FROM chunks WHERE vec IS NOT NULL")?;
+        Ok(st
+            .query_map([], |r| {
+                let b: Vec<u8> = r.get(2)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    crate::embed::from_blob(&b),
+                ))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn chunk_text(&self, path: &str, idx: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT text FROM chunks WHERE path=?1 AND idx=?2",
+                params![path, idx],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn title_mtime_tags(&self, path: &str) -> Result<Option<(String, i64, Vec<String>)>> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT title, mtime FROM notes WHERE path=?1",
+                [path],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((t, m)) = row else { return Ok(None) };
+        let mut st = self
+            .conn
+            .prepare("SELECT tag FROM tags WHERE path=?1 ORDER BY tag")?;
+        let tags = st
+            .query_map([path], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(Some((t, m, tags)))
+    }
+
     pub fn revisions(&self, path: &str) -> Result<Vec<Revision>> {
         let mut st = self.conn.prepare(
             "SELECT id, path, hash, created_at, source, length(content) FROM revisions WHERE path=?1 ORDER BY id DESC",
@@ -717,6 +862,17 @@ fn pick(cands: &[String], src_dir: &str) -> Option<String> {
         .iter()
         .min_by_key(|p| (p.len(), (*p).clone()))
         .cloned()
+}
+
+/// Splits a search string into (free text, tag filters, folder filter).
+pub fn split_filters(q: &str) -> (String, Vec<String>, Option<String>) {
+    let p = parse_query(q);
+    let text = p.fts.replace("\"*", " ").replace('"', " ");
+    (
+        text.split_whitespace().collect::<Vec<_>>().join(" "),
+        p.tags,
+        p.folder,
+    )
 }
 
 #[derive(Debug, Default)]

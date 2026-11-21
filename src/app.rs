@@ -1,5 +1,6 @@
 //! Core service layer shared by the web API and the MCP server.
 
+use crate::embed::{Embedder, Waker};
 use crate::index::{self, Index};
 use crate::note;
 use crate::render;
@@ -8,14 +9,27 @@ use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Semantic hits must score at least this fraction of the best hit.
+const RELATIVE_CUTOFF: f32 = 0.8;
+/// Looser cut-off for "related notes", which is about browsing rather than precision.
+const RELATED_CUTOFF: f32 = 0.5;
+
+/// (note path, chunk index, unit vector)
+type Vectors = Arc<Vec<(String, i64, Vec<f32>)>>;
+type VecCache = Option<(u64, Vectors)>;
+/// path -> (fused score, keyword hit, best semantic chunk)
+type Fused = (String, (f32, Option<index::SearchHit>, Option<i64>));
 
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub daily_dir: String,
     pub memory_dir: String,
     pub attachments_dir: String,
+    pub templates_dir: String,
 }
 
 impl Default for Settings {
@@ -24,6 +38,7 @@ impl Default for Settings {
             daily_dir: "Journal".into(),
             memory_dir: "Memory".into(),
             attachments_dir: "attachments".into(),
+            templates_dir: "Templates".into(),
         }
     }
 }
@@ -34,6 +49,10 @@ pub struct App {
     write_lock: Mutex<()>,
     pub settings: Settings,
     pub data_dir: PathBuf,
+    pub embedder: Option<Embedder>,
+    waker: Mutex<Waker>,
+    embed_error: Mutex<Option<String>>,
+    vcache: Mutex<VecCache>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +121,28 @@ impl App {
             write_lock: Mutex::new(()),
             settings,
             data_dir,
+            embedder: None,
+            waker: Mutex::new(Waker::none()),
+            embed_error: Mutex::new(None),
+            vcache: Mutex::new(None),
         })
+    }
+
+    pub fn with_embedder(mut self, e: Option<Embedder>) -> Self {
+        self.embedder = e;
+        self
+    }
+
+    pub fn set_waker(&self, w: Waker) {
+        *self.waker.lock().unwrap_or_else(|p| p.into_inner()) = w;
+    }
+
+    fn wake(&self) {
+        self.waker.lock().unwrap_or_else(|p| p.into_inner()).wake();
+    }
+
+    pub fn set_embed_error(&self, e: Option<String>) {
+        *self.embed_error.lock().unwrap_or_else(|p| p.into_inner()) = e;
     }
 
     pub fn idx(&self) -> MutexGuard<'_, Index> {
@@ -156,6 +196,10 @@ impl App {
             idx.upsert_file(&f.rel, f.size as i64, f.mtime)?;
         }
         idx.set_folders(&dirs)?;
+        drop(idx);
+        if changed + removed > 0 {
+            self.wake();
+        }
         Ok((changed, removed))
     }
 
@@ -172,7 +216,10 @@ impl App {
             if abs.is_file() {
                 let content = self.vault.read(rel)?;
                 let m = self.vault.meta(rel).context("stat")?;
-                idx.upsert(rel, &content, m.size as i64, m.mtime, "external")?;
+                if idx.upsert(rel, &content, m.size as i64, m.mtime, "external")? {
+                    drop(idx);
+                    self.wake();
+                }
             } else if idx.note_state(rel)?.is_some() {
                 idx.remove(rel, "external")?;
             }
@@ -201,6 +248,14 @@ impl App {
         .map_err(|e| anyhow!("{e}"))?;
         self.write_note("Welcome.md", crate::seed::WELCOME, None, "seed")
             .map_err(|e| anyhow!("{e}"))?;
+        let tdir = &self.settings.templates_dir;
+        for (name, body) in [
+            ("Daily", crate::seed::TEMPLATE_DAILY),
+            ("Meeting", crate::seed::TEMPLATE_MEETING),
+        ] {
+            self.write_note(&format!("{tdir}/{name}.md"), body, None, "seed")
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         self.write_note(
             &format!("{mem}/Inbox.md"),
             &crate::seed::inbox_md(),
@@ -293,6 +348,8 @@ impl App {
         if let Some(dir) = path.rsplit_once('/').map(|(d, _)| d) {
             idx.add_folder(dir)?;
         }
+        drop(idx);
+        self.wake();
         Ok(index::hash(content))
     }
 
@@ -543,7 +600,11 @@ impl App {
         let path = self.daily_path(date)?;
         if !self.vault.exists(&path) {
             let d = note::stem(&path).to_string();
-            let body = format!("---\ntags: [journal]\n---\n# {d}\n\n");
+            let tpl = format!("{}/Daily.md", self.settings.templates_dir);
+            let body = match self.vault.exists(&tpl).then(|| self.vault.read(&tpl)) {
+                Some(Ok(t)) => render_template(&t, &d),
+                _ => format!("---\ntags: [journal]\n---\n# {d}\n\n"),
+            };
             match self.create_note(&path, &body, source) {
                 Ok(_) | Err(AppError::Conflict(_)) => {}
                 Err(e) => return Err(e),
@@ -634,6 +695,421 @@ impl App {
         }
         Ok(self.vault.read_bytes(&path)?)
     }
+}
+
+/// A search result list that may mix keyword and semantic hits.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchOutcome {
+    pub hits: Vec<index::SearchHit>,
+    /// "keyword", "hybrid" or "semantic"
+    pub mode: &'static str,
+    /// Set when semantic search was wanted but failed (falls back to keyword).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Related {
+    pub path: String,
+    pub title: String,
+    pub score: f32,
+    pub snippet: String,
+}
+
+impl App {
+    // ------------------------------------------------------------ semantic search
+
+    pub fn semantic_enabled(&self) -> bool {
+        self.embedder.is_some()
+    }
+
+    fn vectors(&self) -> Result<Vectors> {
+        let idx = self.idx();
+        let mut cache = self.vcache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((g, v)) = cache.as_ref()
+            && *g == idx.vec_gen
+        {
+            return Ok(v.clone());
+        }
+        let v = Arc::new(idx.load_vectors()?);
+        *cache = Some((idx.vec_gen, v.clone()));
+        Ok(v)
+    }
+
+    /// Best-matching notes by meaning: (path, score, best chunk idx).
+    fn nearest(
+        &self,
+        q: &[f32],
+        exclude: Option<&str>,
+        limit: usize,
+        relative: f32,
+    ) -> Result<Vec<(String, f32, i64)>> {
+        let vecs = self.vectors()?;
+        let mut best: HashMap<&str, (f32, i64)> = HashMap::new();
+        for (p, i, v) in vecs.iter() {
+            if Some(p.as_str()) == exclude || v.len() != q.len() {
+                continue;
+            }
+            let sc = crate::embed::dot(q, v);
+            let e = best.entry(p.as_str()).or_insert((f32::MIN, *i));
+            if sc > e.0 {
+                *e = (sc, *i);
+            }
+        }
+        let mut out: Vec<(String, f32, i64)> = best
+            .into_iter()
+            .map(|(p, (s, i))| (p.to_string(), s, i))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Keep only hits reasonably close to the best one, so unrelated notes don't trail along.
+        let floor = self
+            .embedder
+            .as_ref()
+            .map(|e| e.cfg.min_score)
+            .unwrap_or(0.0);
+        if let Some(top) = out.first().map(|x| x.1) {
+            let cut = floor.max(top * relative).max(f32::EPSILON);
+            out.retain(|x| x.1 >= cut);
+        }
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Keyword search, optionally fused with semantic search (reciprocal rank fusion).
+    /// `mode`: "auto" (hybrid when embeddings are configured), "keyword" or "semantic".
+    pub fn search(&self, query: &str, limit: usize, mode: &str) -> AResult<SearchOutcome> {
+        let (text, tags, folder) = index::split_filters(query);
+        let want_sem = self.embedder.is_some() && !text.is_empty() && mode != "keyword";
+        let keyword = if mode == "semantic" && want_sem {
+            Vec::new()
+        } else {
+            self.idx().search(query, limit.max(30))?
+        };
+        if !want_sem {
+            let mut hits = keyword;
+            hits.truncate(limit);
+            return Ok(SearchOutcome {
+                hits,
+                mode: "keyword",
+                warning: None,
+            });
+        }
+        let qv = match self.embedder.as_ref().unwrap().embed_query(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut hits = keyword;
+                hits.truncate(limit);
+                return Ok(SearchOutcome {
+                    hits,
+                    mode: "keyword",
+                    warning: Some(format!("semantic search unavailable: {e:#}")),
+                });
+            }
+        };
+        let sem = self.nearest(&qv, None, limit.max(30), RELATIVE_CUTOFF)?;
+        let idx = self.idx();
+        let tag_ok = |t: &[String]| {
+            tags.iter()
+                .all(|q| t.iter().any(|x| x == q || x.starts_with(&format!("{q}/"))))
+        };
+        let folder_ok = |p: &str| {
+            folder
+                .as_deref()
+                .is_none_or(|f| f.is_empty() || p.starts_with(&format!("{f}/")))
+        };
+
+        const K: f32 = 60.0;
+        let mut fused: HashMap<String, (f32, Option<index::SearchHit>, Option<i64>)> =
+            HashMap::new();
+        for (rank, h) in keyword.into_iter().enumerate() {
+            let e = fused.entry(h.path.clone()).or_insert((0.0, None, None));
+            e.0 += 1.0 / (K + rank as f32 + 1.0);
+            e.1 = Some(h);
+        }
+        let mut rank = 0;
+        for (p, _score, ci) in sem {
+            if !folder_ok(&p) {
+                continue;
+            }
+            let e = fused.entry(p).or_insert((0.0, None, None));
+            e.0 += 1.0 / (K + rank as f32 + 1.0);
+            e.2 = Some(ci);
+            rank += 1;
+        }
+        let mut ranked: Vec<Fused> = fused.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let mut hits = Vec::new();
+        for (path, (_, kw, ci)) in ranked {
+            let hit = match kw {
+                Some(h) => h,
+                None => {
+                    let Some((title, mtime, t)) = idx.title_mtime_tags(&path)? else {
+                        continue;
+                    };
+                    if !tag_ok(&t) {
+                        continue;
+                    }
+                    let snippet = ci
+                        .and_then(|i| idx.chunk_text(&path, i).ok().flatten())
+                        .map(|c| short_snippet(&c))
+                        .unwrap_or_default();
+                    index::SearchHit {
+                        path,
+                        title,
+                        snippet,
+                        tags: t,
+                        mtime,
+                        semantic: true,
+                    }
+                }
+            };
+            hits.push(hit);
+            if hits.len() >= limit {
+                break;
+            }
+        }
+        Ok(SearchOutcome {
+            hits,
+            mode: if mode == "semantic" {
+                "semantic"
+            } else {
+                "hybrid"
+            },
+            warning: None,
+        })
+    }
+
+    /// Notes closest in meaning to `path` (uses stored vectors only, no API call).
+    pub fn related(&self, path: &str, limit: usize) -> AResult<Vec<Related>> {
+        if self.embedder.is_none() {
+            return Ok(Vec::new());
+        }
+        let vecs = self.vectors()?;
+        let mine: Vec<&Vec<f32>> = vecs
+            .iter()
+            .filter(|(p, _, _)| p == path)
+            .map(|(_, _, v)| v)
+            .collect();
+        if mine.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dim = mine[0].len();
+        let mut centroid = vec![0f32; dim];
+        for v in &mine {
+            for (c, x) in centroid.iter_mut().zip(v.iter()) {
+                *c += x;
+            }
+        }
+        let centroid = crate::embed::normalize(centroid);
+        let near = self.nearest(&centroid, Some(path), limit, RELATED_CUTOFF)?;
+        let idx = self.idx();
+        let mut out = Vec::new();
+        for (p, score, ci) in near {
+            if let Some((title, _, _)) = idx.title_mtime_tags(&p)? {
+                let snippet = idx
+                    .chunk_text(&p, ci)?
+                    .map(|c| short_snippet(&c))
+                    .unwrap_or_default();
+                out.push(Related {
+                    path: p,
+                    title,
+                    score,
+                    snippet,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn embed_status(&self) -> Value {
+        let (done, total) = self.idx().embed_stats().unwrap_or((0, 0));
+        let err = self
+            .embed_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        match &self.embedder {
+            Some(e) => serde_json::json!({
+                "enabled": true, "model": e.cfg.model, "done": done, "total": total, "error": err,
+            }),
+            None => serde_json::json!({"enabled": false, "done": 0, "total": total}),
+        }
+    }
+
+    // ------------------------------------------------------------ templates
+
+    pub fn templates(&self) -> AResult<Vec<index::NoteMeta>> {
+        Ok(self
+            .idx()
+            .list(Some(&self.settings.templates_dir), false, 500)?)
+    }
+
+    /// Renders a template note for a new note called `title`.
+    pub fn render_template_note(&self, template: &str, title: &str) -> AResult<String> {
+        let path = Vault::clean_note(template).map_err(bad)?;
+        if !self.vault.exists(&path) {
+            return Err(AppError::NotFound(format!("template not found: {path}")));
+        }
+        Ok(render_template(&self.vault.read(&path)?, title))
+    }
+
+    // ------------------------------------------------------------ folders
+
+    /// Renames/moves a folder with everything in it, rewriting links to moved notes.
+    pub fn rename_folder(
+        &self,
+        from: &str,
+        to: &str,
+        source: &str,
+    ) -> AResult<(String, usize, usize)> {
+        let from = Vault::clean(from).map_err(bad)?;
+        let to = Vault::clean(to).map_err(bad)?;
+        if from == to {
+            return Ok((to, 0, 0));
+        }
+        if !self.vault.abs(&from).is_dir() {
+            return Err(AppError::NotFound(format!("folder not found: {from}")));
+        }
+        if to.starts_with(&format!("{from}/")) {
+            return Err(AppError::BadRequest(
+                "cannot move a folder into itself".into(),
+            ));
+        }
+        if self.vault.abs(&to).exists() {
+            return Err(AppError::Conflict(format!("{to} already exists")));
+        }
+        let (notes, files, dirs) = self.vault.scan();
+        let prefix = format!("{from}/");
+        let moved_notes: Vec<String> = notes
+            .into_iter()
+            .map(|e| e.rel)
+            .filter(|p| p.starts_with(&prefix))
+            .collect();
+        let moved_files: Vec<String> = files
+            .into_iter()
+            .map(|e| e.rel)
+            .filter(|p| p.starts_with(&prefix))
+            .collect();
+        let new_path = |p: &str| format!("{to}/{}", &p[prefix.len()..]);
+
+        // Notes one by one so that links pointing at them are rewritten.
+        let mut updated = 0;
+        for n in &moved_notes {
+            let (_, u) = self.rename_note(n, &new_path(n), source)?;
+            updated += u;
+        }
+        // Attachments and other files.
+        {
+            let _w = self.wlock();
+            for f in &moved_files {
+                let dst = new_path(f);
+                self.vault.rename(f, &dst)?;
+                let idx = self.idx();
+                idx.remove_file(f)?;
+                if let Some(m) = self.vault.meta(&dst) {
+                    idx.upsert_file(&dst, m.size as i64, m.mtime)?;
+                }
+            }
+            // Empty sub-folders, then remove the old tree (only empty dirs remain).
+            for d in dirs.iter().filter(|d| d.starts_with(&prefix)) {
+                self.vault.mkdir(&new_path(d))?;
+            }
+            self.vault.mkdir(&to)?;
+            let mut old: Vec<&String> = dirs
+                .iter()
+                .filter(|d| d.starts_with(&prefix) || **d == from)
+                .collect();
+            old.sort_by_key(|d| std::cmp::Reverse(d.len()));
+            for d in old {
+                let _ = self.vault.rmdir(d);
+            }
+        }
+        self.sync(false)?;
+        Ok((to, moved_notes.len() + moved_files.len(), updated))
+    }
+}
+
+fn short_snippet(chunk: &str) -> String {
+    // Skip the "title › heading" context line.
+    let body = chunk.split_once('\n').map(|(_, b)| b).unwrap_or(chunk);
+    let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut s: String = flat.chars().take(180).collect();
+    if flat.chars().count() > 180 {
+        s.push('…');
+    }
+    s
+}
+
+/// Fills Obsidian-style template variables: `{{title}}`, `{{date}}`, `{{time}}`,
+/// `{{date:YYYY-MM-DD}}` / `{{time:HH:mm}}` (moment.js-style tokens).
+pub fn render_template(tpl: &str, title: &str) -> String {
+    let now = chrono::Local::now();
+    let re = Regex::new(r"\{\{\s*(title|date|time|datetime)(?::([^}]*))?\s*\}\}").unwrap();
+    re.replace_all(tpl, |c: &regex::Captures| {
+        let fmt = c.get(2).map(|m| m.as_str().trim());
+        match (&c[1], fmt) {
+            ("title", _) => title.to_string(),
+            ("date", None) => now.format("%Y-%m-%d").to_string(),
+            ("time", None) => now.format("%H:%M").to_string(),
+            ("datetime", None) => now.format("%Y-%m-%d %H:%M").to_string(),
+            (_, Some(f)) => now.format(&moment_to_chrono(f)).to_string(),
+            _ => String::new(),
+        }
+    })
+    .into_owned()
+}
+
+fn moment_to_chrono(f: &str) -> String {
+    const TOKENS: &[(&str, &str)] = &[
+        ("YYYY", "%Y"),
+        ("YY", "%y"),
+        ("MMMM", "%B"),
+        ("MMM", "%b"),
+        ("MM", "%m"),
+        ("M", "%-m"),
+        ("DDDD", "%j"),
+        ("DD", "%d"),
+        ("D", "%-d"),
+        ("dddd", "%A"),
+        ("ddd", "%a"),
+        ("HH", "%H"),
+        ("H", "%-H"),
+        ("hh", "%I"),
+        ("h", "%-I"),
+        ("mm", "%M"),
+        ("ss", "%S"),
+        ("A", "%p"),
+        ("a", "%P"),
+        ("ww", "%V"),
+        ("w", "%-V"),
+    ];
+    let mut out = String::new();
+    let mut rest = f;
+    'outer: while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix('[') {
+            // [literal text]
+            if let Some(end) = r.find(']') {
+                out.push_str(&r[..end].replace('%', "%%"));
+                rest = &r[end + 1..];
+                continue;
+            }
+        }
+        for (tok, rep) in TOKENS {
+            if let Some(r) = rest.strip_prefix(tok) {
+                out.push_str(rep);
+                rest = r;
+                continue 'outer;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        if ch == '%' {
+            out.push_str("%%");
+        } else {
+            out.push(ch);
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
 }
 
 /// Inserts `text` at the end of the section that starts with heading `h`
@@ -757,6 +1233,46 @@ mod tests {
             "# T\n\n## A\n- a1\n\n## B\n- b1\n- b2\n"
         );
         assert!(insert_under_heading(c, "C", "x").ends_with("## C\n\nx\n"));
+    }
+
+    #[test]
+    fn templates_render() {
+        let out = render_template(
+            "# {{title}}\n{{date:YYYY [yılı] MM}} {{ time }} {{unknown}}",
+            "Toplantı",
+        );
+        assert!(out.starts_with("# Toplantı\n"), "{out}");
+        assert!(out.contains(" yılı "), "{out}");
+        assert!(out.contains("{{unknown}}"));
+        assert_eq!(moment_to_chrono("dddd, D MMMM YYYY"), "%A, %-d %B %Y");
+    }
+
+    #[test]
+    fn folder_rename_moves_everything() {
+        let (_d, a) = app();
+        a.write_note("Eski/Alt/Not.md", "x", None, "t").unwrap();
+        a.write_note("Eski/Diğer.md", "[[Eski/Alt/Not]]", None, "t")
+            .unwrap();
+        a.write_note("Dış.md", "[[Eski/Alt/Not|n]] [[Diğer]]", None, "t")
+            .unwrap();
+        a.upload("x.png", b"png").unwrap();
+        a.vault.rename("attachments/x.png", "Eski/x.png").unwrap();
+        a.full_sync().unwrap();
+        let (to, moved, updated) = a.rename_folder("Eski", "Yeni/Klasör", "t").unwrap();
+        assert_eq!(to, "Yeni/Klasör");
+        assert_eq!(moved, 3);
+        assert!(updated >= 2);
+        assert_eq!(
+            a.read_note("Dış.md").unwrap().content,
+            "[[Klasör/Alt/Not|n]] [[Diğer]]".replace("Klasör/Alt/Not", "Not")
+        );
+        assert!(a.vault.exists("Yeni/Klasör/x.png"));
+        assert!(!a.vault.abs("Eski").exists());
+        assert!(a.rename_folder("Yeni", "Yeni/iç", "t").is_err());
+        assert_eq!(
+            a.idx().backlinks("Yeni/Klasör/Alt/Not.md").unwrap().len(),
+            2
+        );
     }
 
     #[test]

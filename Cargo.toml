@@ -1,6 +1,6 @@
 [package]
 name = "mindcrab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted Obsidian-style Markdown notebook with an MCP server for AI memory"
 license = "MIT"
 repository = "https://github.com/mustafabayramguven/MindCrab"
@@ -29,6 +29,7 @@ tokio = { version = "1.54.1", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["trace", "compression-gzip", "set-header", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.5.2", features = ["json"] }
 walkdir = "2.5.1"
 
 [dev-dependencies]

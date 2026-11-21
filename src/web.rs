@@ -32,6 +32,23 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
 ];
 
 const INDEX: &[u8] = include_bytes!("../web/index.html");
+const SW: &str = include_str!("../web/sw.js");
+
+/// Changes whenever any embedded asset changes, so the service worker updates its cache.
+static ASSET_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(INDEX);
+    h.update(SW.as_bytes());
+    for (p, _, b) in ASSETS {
+        h.update(p.as_bytes());
+        h.update(b);
+    }
+    hex::encode(&h.finalize()[..6])
+});
+
+static SW_BODY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| SW.replace("__VERSION__", &ASSET_VERSION));
 
 fn respond(mime: &'static str, body: &'static [u8], cache: &'static str) -> Response {
     let mut r = body.into_response();
@@ -61,7 +78,19 @@ fn index() -> Response {
 }
 
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    let mut r = Router::new().route("/", get(|| async { index() }));
+    let mut r = Router::new().route("/", get(|| async { index() })).route(
+        "/sw.js",
+        get(|| async {
+            let mut r = respond(
+                "text/javascript; charset=utf-8",
+                SW_BODY.as_bytes(),
+                "no-cache",
+            );
+            r.headers_mut()
+                .insert("service-worker-allowed", HeaderValue::from_static("/"));
+            r
+        }),
+    );
     for (path, mime, body) in ASSETS {
         let cache = if path.starts_with("/fonts/") {
             "public, max-age=31536000, immutable"

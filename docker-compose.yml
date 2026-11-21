@@ -17,6 +17,10 @@ services:
       # Optional separate token for AI clients (MCP) so you can revoke them independently.
       MINDCRAB_MCP_TOKEN: ${MINDCRAB_MCP_TOKEN:-}
       # MINDCRAB_MCP_READ_ONLY: "true"
+      # Semantic search (optional) — any OpenAI-compatible embeddings API, see README.
+      # MINDCRAB_EMBED_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      # MINDCRAB_EMBED_MODEL: gemini-embedding-001
+      # MINDCRAB_EMBED_KEY: ${GEMINI_API_KEY:-}
       # Set to "true" when served over HTTPS (reverse proxy).
       MINDCRAB_COOKIE_SECURE: ${MINDCRAB_COOKIE_SECURE:-false}
     # Match the owner of ./vault on the host (id -u / id -g).

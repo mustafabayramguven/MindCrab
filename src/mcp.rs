@@ -158,11 +158,12 @@ pub fn tool_defs(read_only: bool) -> Vec<Value> {
         tool(
             "search_notes",
             "Search notes",
-            "Full-text search over all notes (title, body, tags), ranked by relevance. Diacritics are ignored (seker finds şeker). Filters: tag:name, path:Folder, \"exact phrase\". Use this to recall what the user told you before.",
+            "Searches all notes by words and — when semantic search is configured — by meaning, so it also finds notes phrased differently (results marked ≈). Diacritics are ignored (seker finds şeker). Filters: tag:name, path:Folder, \"exact phrase\". Use this to recall what the user told you before.",
             schema(
                 json!({
                     "query": {"type": "string", "description": "Search words and optional filters, e.g. 'docker caddy tag:server'"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "mode": {"type": "string", "enum": ["auto", "keyword", "semantic"], "default": "auto", "description": "auto = keywords + meaning (when semantic search is configured)"}
                 }),
                 &["query"],
             ),
@@ -197,6 +198,17 @@ pub fn tool_defs(read_only: bool) -> Vec<Value> {
             "Get links",
             "Shows the knowledge graph around a note: backlinks (with context), outgoing links (resolved or missing) and unlinked mentions.",
             schema(json!({"path": path}), &["path"]),
+            true,
+            false,
+        ),
+        tool(
+            "related_notes",
+            "Related notes",
+            "Notes closest in meaning to the given note (needs semantic search). Good for finding context the user never linked.",
+            schema(
+                json!({"path": path, "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8}}),
+                &["path"],
+            ),
             true,
             false,
         ),
@@ -298,7 +310,7 @@ pub fn tool_defs(read_only: bool) -> Vec<Value> {
         tool(
             "move_note",
             "Move / rename note",
-            "Renames or moves a note and updates every [[link]] that points to it.",
+            "Renames or moves a note — or a whole folder — and updates every [[link]] that points to the moved notes.",
             schema(json!({"from": path, "to": {"type": "string", "description": "New path"}}), &["from", "to"]),
             false,
             false,
@@ -363,7 +375,19 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                     "(No MEMORY.md yet. You may create one as an index for future sessions.)\n\n",
                 ),
             }
+            let es = app.embed_status();
+            let sem = if es["enabled"] == true {
+                format!(
+                    "on ({}, {}/{} chunks indexed)",
+                    es["model"].as_str().unwrap_or(""),
+                    es["done"],
+                    es["total"]
+                )
+            } else {
+                "off (keyword search only)".to_string()
+            };
             let idx = app.idx();
+            let _ = writeln!(out, "Semantic search: {sem}.");
             let _ = writeln!(
                 out,
                 "## Vault\n{} notes. Today is {}.\n",
@@ -401,7 +425,12 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 .and_then(Value::as_u64)
                 .unwrap_or(10)
                 .clamp(1, 50) as usize;
-            let hits = app.idx().search(q, limit)?;
+            let mode = s(a, "mode").unwrap_or("auto");
+            let res = app.search(q, limit, mode)?;
+            if let Some(w) = &res.warning {
+                let _ = writeln!(out, "(note: {w}; showing keyword results)");
+            }
+            let hits = res.hits;
             if hits.is_empty() {
                 return Ok(format!(
                     "No notes match '{q}'. Try fewer or different words."
@@ -413,7 +442,8 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 } else {
                     format!(" [#{}]", h.tags.join(" #"))
                 };
-                let _ = writeln!(out, "- **{}** — {}{tags}", h.path, h.title);
+                let mark = if h.semantic { " ≈" } else { "" };
+                let _ = writeln!(out, "- **{}**{mark} — {}{tags}", h.path, h.title);
                 if !h.snippet.is_empty() {
                     let _ = writeln!(out, "  {}", clean_snippet(&h.snippet));
                 }
@@ -483,6 +513,30 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 for h in un {
                     let _ = writeln!(out, "- {} — {}", h.path, clean_snippet(&h.snippet));
                 }
+            }
+        }
+        "related_notes" => {
+            let path = app.find_note(req(a, "path")?)?;
+            if !app.semantic_enabled() {
+                return Ok("Semantic search is not configured on this server (MINDCRAB_EMBED_URL / MINDCRAB_EMBED_MODEL). Use get_links instead.".into());
+            }
+            let limit = a
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(8)
+                .clamp(1, 30) as usize;
+            let rel = app.related(&path, limit)?;
+            if rel.is_empty() {
+                return Ok(format!(
+                    "No related notes yet for {path} (it may not be embedded yet)."
+                ));
+            }
+            for r in rel {
+                let _ = writeln!(
+                    out,
+                    "- **{}** — {} (similarity {:.2})\n  {}",
+                    r.path, r.title, r.score, r.snippet
+                );
             }
         }
         "list_tags" => {
@@ -605,9 +659,21 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
             );
         }
         "move_note" => {
-            let from = app.find_note(req(a, "from")?)?;
-            let (to, n) = app.rename_note(&from, req(a, "to")?, &src)?;
-            let _ = write!(out, "Moved {from} → {to}; updated links in {n} note(s).");
+            let from_raw = req(a, "from")?;
+            let folder = crate::vault::Vault::clean(from_raw)
+                .ok()
+                .filter(|f| app.vault.abs(f).is_dir());
+            if let Some(f) = folder {
+                let (to, moved, n) = app.rename_folder(&f, req(a, "to")?, &src)?;
+                let _ = write!(
+                    out,
+                    "Moved folder {f} → {to} ({moved} files); updated links in {n} note(s)."
+                );
+            } else {
+                let from = app.find_note(from_raw)?;
+                let (to, n) = app.rename_note(&from, req(a, "to")?, &src)?;
+                let _ = write!(out, "Moved {from} → {to}; updated links in {n} note(s).");
+            }
         }
         "delete_note" => {
             let path = app.find_note(req(a, "path")?)?;
@@ -682,7 +748,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
         )
         .unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 16);
         let r = handle(
             &app,
             &mut s,

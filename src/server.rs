@@ -102,6 +102,11 @@ pub fn router(shared: Arc<Shared>) -> Router {
                 .post(create_note),
         )
         .route("/note/rename", post(rename_note))
+        .route("/folder/rename", post(rename_folder))
+        .route("/related", get(related))
+        .route("/embed-status", get(embed_status))
+        .route("/templates", get(templates))
+        .route("/template/render", post(render_template))
         .route("/folder", post(create_folder).delete(delete_folder))
         .route("/search", get(search))
         .route("/links", get(links))
@@ -227,15 +232,20 @@ struct CreateNote {
     path: String,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    template: Option<String>,
 }
 
 async fn create_note(State(st): St, Json(r): Json<CreateNote>) -> ApiResult<Json<Value>> {
     run(&st, move |app| {
         let path = crate::vault::Vault::clean_note(&r.path)
             .map_err(|e| AppError::BadRequest(e.to_string()))?;
-        let content = r
-            .content
-            .unwrap_or_else(|| format!("# {}\n\n", crate::note::stem(&path)));
+        let title = crate::note::stem(&path).to_string();
+        let content = match (r.content, r.template.as_deref().filter(|t| !t.is_empty())) {
+            (Some(c), _) => c,
+            (None, Some(t)) => app.render_template_note(t, &title)?,
+            (None, None) => format!("# {title}\n\n"),
+        };
         let w = app.create_note(&path, &content, "web")?;
         Ok(Json(serde_json::to_value(w).unwrap()))
     })
@@ -283,12 +293,62 @@ async fn delete_folder(State(st): St, Query(q): Query<PathQ>) -> ApiResult<Json<
 struct SearchQ {
     q: String,
     limit: Option<usize>,
+    mode: Option<String>,
 }
 
 async fn search(State(st): St, Query(q): Query<SearchQ>) -> ApiResult<Json<Value>> {
     run(&st, move |app| {
-        let hits = app.idx().search(&q.q, q.limit.unwrap_or(30).min(200))?;
-        Ok(Json(json!({"hits": hits})))
+        let out = app.search(
+            &q.q,
+            q.limit.unwrap_or(30).min(200),
+            q.mode.as_deref().unwrap_or("auto"),
+        )?;
+        Ok(Json(serde_json::to_value(out).unwrap()))
+    })
+    .await
+}
+
+async fn related(State(st): St, Query(q): Query<PathQ>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(json!({"related": app.related(&q.path, 10)?})))
+    })
+    .await
+}
+
+async fn embed_status(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| Ok(Json(app.embed_status()))).await
+}
+
+async fn templates(State(st): St) -> ApiResult<Json<Value>> {
+    run(&st, |app| {
+        Ok(Json(
+            json!({"templates": app.templates()?, "folder": app.settings.templates_dir}),
+        ))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct TemplateReq {
+    template: String,
+    title: String,
+}
+
+async fn render_template(State(st): St, Json(r): Json<TemplateReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        Ok(Json(
+            json!({"content": app.render_template_note(&r.template, &r.title)?}),
+        ))
+    })
+    .await
+}
+
+async fn rename_folder(State(st): St, Json(r): Json<RenameReq>) -> ApiResult<Json<Value>> {
+    run(&st, move |app| {
+        let (to, moved, updated) = app.rename_folder(&r.from, &r.to, "web")?;
+        Ok(Json(
+            json!({"path": to, "moved": moved, "updated_links": updated}),
+        ))
     })
     .await
 }

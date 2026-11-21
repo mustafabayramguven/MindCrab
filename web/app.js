@@ -15,6 +15,15 @@ const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 const store = {
   get(k, d) { try { const v = localStorage.getItem("mc." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem("mc." + k, JSON.stringify(v)); } catch {} },
+  del(k) { try { localStorage.removeItem("mc." + k); } catch {} },
+};
+
+// Unsaved edits survive reloads, crashes and offline periods.
+const drafts = {
+  key: (p) => "draft:" + p,
+  get: (p) => store.get(drafts.key(p), null),
+  put: (p, content, base) => store.set(drafts.key(p), { content, base, t: Date.now() }),
+  clear: (p) => store.del(drafts.key(p)),
 };
 
 // ------------------------------------------------------------------ icons
@@ -40,10 +49,12 @@ async function api(method, url, body, opts = {}) {
     else { init.body = JSON.stringify(body); init.headers["content-type"] = "application/json"; }
   }
   let res;
-  try { res = await fetch(url, init); } catch (e) { throw new ApiError(0, e.message); }
+  try { res = await fetch(url, init); } catch (e) { setOffline(true); throw new ApiError(0, e.message); }
   if (res.status === 401 && !opts.noAuthRedirect) { showLogin(); throw new ApiError(401, "login required"); }
   const data = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
+  if (res.status === 503 && data?.offline) { setOffline(true); throw new ApiError(0, "offline"); }
   if (!res.ok) throw new ApiError(res.status, data?.error || res.statusText);
+  if (S.offline && method === "GET" && res.headers.get("date")) setOffline(!navigator.onLine);
   return data;
 }
 
@@ -57,6 +68,8 @@ const S = {
   view: "empty",
   pendingAnchor: null,
   graph: null,
+  semantic: false,
+  offline: !navigator.onLine,
 };
 
 // ------------------------------------------------------------------ theme
@@ -108,7 +121,16 @@ function toast(msg, action) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (el.hidden = true), action ? 6000 : 3000);
 }
-const fail = (e) => { if (e?.status !== 401) toast(t("toast.error", { msg: e.message || e })); };
+const fail = (e) => { if (e?.status !== 401 && e?.status !== 0) toast(t("toast.error", { msg: e.message || e })); };
+
+function setOffline(v) {
+  if (S.offline === v) return;
+  S.offline = v;
+  $("#offline-banner").hidden = !v;
+  if (!v && S.dirty) save();
+}
+addEventListener("online", () => { setOffline(false); poll(); });
+addEventListener("offline", () => setOffline(true));
 
 function closeMenu() { $("#menu").hidden = true; }
 function openMenu(anchor, items) {
@@ -139,7 +161,7 @@ document.addEventListener("pointerdown", (e) => {
   if (!e.target.closest("#suggest") && e.target !== $("#editor")) hideSuggest();
 });
 
-function dialogPrompt({ title, text = "", label = "", value = "", ok = t("action.create"), input = true, danger = false }) {
+function dialogPrompt({ title, text = "", label = "", value = "", ok = t("action.create"), input = true, danger = false, select = null }) {
   const d = $("#prompt-dialog");
   $("#prompt-title").textContent = title;
   $("#prompt-text").textContent = text;
@@ -151,10 +173,18 @@ function dialogPrompt({ title, text = "", label = "", value = "", ok = t("action
   const okBtn = $("#prompt-ok");
   okBtn.textContent = ok;
   okBtn.className = "btn " + (danger ? "danger" : "filled");
+  const sw = $("#prompt-select-wrap");
+  sw.hidden = !select;
+  if (select) {
+    $("#prompt-select-label").textContent = select.label;
+    $("#prompt-select").innerHTML = select.options.map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+    $("#prompt-select").value = select.value ?? "";
+  }
   return new Promise((resolve) => {
     d.onclose = () => {
       const v = d.returnValue === "ok" ? (input ? inp.value.trim() : true) : null;
-      resolve(v || null);
+      if (select) resolve(v ? { value: v, choice: $("#prompt-select").value } : null);
+      else resolve(v || null);
     };
     d.returnValue = "";
     d.showModal();
@@ -343,6 +373,7 @@ function folderMenu(anchor, folder) {
   openMenu(anchor, [
     { icon: "note_add", label: t("action.newHere"), run: () => newNote(folder) },
     { icon: "create_new_folder", label: t("action.folderHere"), run: () => newFolder(folder) },
+    { icon: "drive_file_move", label: t("action.renameFolder"), run: () => renameFolder(folder) },
     "-",
     { icon: "delete", label: t("action.delete"), danger: true, run: () => deleteFolder(folder) },
   ]);
@@ -384,6 +415,16 @@ async function openNote(path, { keepScroll = false } = {}) {
   showView("note");
   setTitle();
   setSaveState("saved");
+  const draft = drafts.get(note.path);
+  if (draft && draft.content !== note.content) {
+    let use = draft.base === note.hash;
+    if (!use) use = !!(await dialogPrompt({ title: t("draft.title"), text: t("draft.body"), input: false, ok: t("draft.use") }));
+    if (use && S.path === note.path) {
+      ed.value = draft.content;
+      onEdit();
+      if (draft.base === note.hash) toast(t("draft.restored"));
+    } else if (!use) drafts.clear(note.path);
+  } else if (draft) drafts.clear(note.path);
   setMode(S.mode);
   highlightTree();
   store.set("last", note.path);
@@ -407,8 +448,14 @@ function setSaveState(s) {
   el.title = t(key);
 }
 
+let draftTimer;
 function onEdit() {
   S.dirty = $("#editor").value !== S.content;
+  clearTimeout(draftTimer);
+  if (S.path && S.note) {
+    const path = S.path, base = S.note.hash;
+    draftTimer = setTimeout(() => (S.dirty ? drafts.put(path, $("#editor").value, base) : drafts.clear(path)), 400);
+  }
   setSaveState(S.dirty ? "dirty" : "saved");
   clearTimeout(S.saveTimer);
   if (S.dirty) S.saveTimer = setTimeout(save, 900);
@@ -429,12 +476,15 @@ async function save({ force = false } = {}) {
       S.note.hash = r.hash;
       S.content = content;
       S.dirty = $("#editor").value !== content;
+      const d = drafts.get(path);
+      if (!S.dirty || (d && d.content === content)) { clearTimeout(draftTimer); drafts.clear(path); }
+      setOffline(false);
       setSaveState(S.dirty ? "dirty" : "saved");
       if (S.dirty) S.saveTimer = setTimeout(save, 900);
       refreshMeta();
     } catch (e) {
       if (e.status === 409) return conflict();
-      if (e.status === 0) { setSaveState("offline"); S.saveTimer = setTimeout(save, 5000); return; }
+      if (e.status === 0) { setSaveState("offline"); drafts.put(path, content, S.note.hash); S.saveTimer = setTimeout(save, 15000); return; }
       setSaveState("error");
       fail(e);
     } finally {
@@ -483,7 +533,11 @@ function renderPreview(now = false) {
       pv.innerHTML = propsHtml + r.html;
       pv.querySelectorAll('input[type="checkbox"]').forEach((cb, i) => { cb.disabled = false; cb.dataset.task = i; });
       if (S.pendingAnchor) { scrollToHeading(S.pendingAnchor); S.pendingAnchor = null; }
-    } catch (e) { fail(e); }
+    } catch (e) {
+      if (e.status === 0 && seq === previewSeq) {
+        $("#preview").innerHTML = `<p class="muted">${esc(t("preview.offline"))}</p><pre>${esc($("#editor").value)}</pre>`;
+      } else fail(e);
+    }
   }, now ? 0 : 250);
 }
 
@@ -523,10 +577,19 @@ $("#preview").addEventListener("click", (e) => {
 async function newNote(folder) {
   const base = folder ?? (S.path ? dirOf(S.path) : "");
   const def = (base ? base + "/" : "") + (LANG === "tr" ? "Adsız" : "Untitled");
-  let name = await dialogPrompt({ title: t("prompt.newNote"), label: t("prompt.path"), value: def });
-  if (!name) return;
+  let tpls = [];
+  try { tpls = (await api("GET", "/api/templates")).templates; } catch {}
+  const lastTpl = store.get("template", "");
+  const res = await dialogPrompt({
+    title: t("prompt.newNote"), label: t("prompt.path"), value: def,
+    select: tpls.length ? { label: t("template.label"), value: tpls.some((x) => x.path === lastTpl) ? lastTpl : "", options: [{ value: "", label: t("template.none") }, ...tpls.map((x) => ({ value: x.path, label: stem(x.path) }))] } : null,
+  });
+  if (!res) return;
+  const name = typeof res === "string" ? res : res.value;
+  const template = typeof res === "string" ? "" : res.choice;
+  store.set("template", template);
   try {
-    const r = await api("POST", "/api/note", { path: name });
+    const r = await api("POST", "/api/note", { path: name, template: template || undefined });
     await loadTree();
     S.mode === "preview" && setMode("edit");
     go(r.path);
@@ -554,6 +617,20 @@ async function renameNote(from, to) {
     toast(t("toast.renamed", { n: r.updated_links }));
     await loadTree();
     if (S.path === from) { S.path = r.path; location.hash = "#/n/" + encPath(r.path); }
+    else if (S.path) openNote(S.path, { keepScroll: true });
+  } catch (e) { fail(e); }
+}
+
+async function renameFolder(folder) {
+  const to = await dialogPrompt({ title: t("action.renameFolder"), label: t("prompt.path"), value: folder, ok: t("action.save") });
+  if (!to || to === folder) return;
+  try {
+    if (S.dirty) await save();
+    const r = await api("POST", "/api/folder/rename", { from: folder, to });
+    toast(t("toast.folderMoved", { n: r.moved, l: r.updated_links }));
+    if (S.collapsed.delete(folder)) store.set("collapsed", [...S.collapsed]);
+    await loadTree();
+    if (S.path && S.path.startsWith(folder + "/")) go(r.path + S.path.slice(folder.length));
     else if (S.path) openNote(S.path, { keepScroll: true });
   } catch (e) { fail(e); }
 }
@@ -628,7 +705,32 @@ const FMT = {
   wikilink: () => { wrap("[[", "]]"); setTimeout(updateSuggest, 0); },
   tag: () => insert("#"),
   attach: () => $("#file-input").click(),
+  template: () => insertTemplate(),
 };
+
+async function insertTemplate() {
+  let r;
+  try { r = await api("GET", "/api/templates"); } catch (e) { return fail(e); }
+  const btn = $('#toolbar [data-fmt="template"]');
+  if (!r.templates.length) return toast(t("template.empty", { dir: r.folder }));
+  const pos = [ed.selectionStart, ed.selectionEnd];
+  openMenu(btn, r.templates.map((x) => ({
+    icon: "note_stack",
+    label: stem(x.path),
+    run: async () => {
+      try {
+        let { content } = await api("POST", "/api/template/render", { template: x.path, title: stem(S.path || "") });
+        // Drop the template's frontmatter unless inserting at the very top of an empty-frontmatter note.
+        if (pos[0] > 0 || ed.value.startsWith("---")) content = content.replace(/^---\r?\n[\s\S]*?\r?\n(---|\.\.\.)\r?\n/, "");
+        const before = ed.value.slice(0, pos[0]);
+        if (before && !before.endsWith("\n\n")) content = (before.endsWith("\n") ? "\n" : "\n\n") + content;
+        ed.focus();
+        ed.setSelectionRange(pos[0], pos[1]);
+        insert(content);
+      } catch (e) { fail(e); }
+    },
+  })));
+}
 $("#toolbar").addEventListener("mousedown", (e) => e.target.closest("button") && e.preventDefault());
 $("#toolbar").addEventListener("click", (e) => { const b = e.target.closest("button[data-fmt]"); if (b) FMT[b.dataset.fmt](); });
 
@@ -774,7 +876,10 @@ async function loadPanel() {
   const path = S.path;
   try {
     if (S.tab === "links") {
-      const r = await api("GET", "/api/links?path=" + encodeURIComponent(path));
+      const [r, rel] = await Promise.all([
+        api("GET", "/api/links?path=" + encodeURIComponent(path)),
+        S.semantic ? api("GET", "/api/related?path=" + encodeURIComponent(path)).catch(() => ({ related: [] })) : { related: [] },
+      ]);
       if (S.path !== path) return;
       const item = (p, title, ctx) => `<a class="panel-item" href="#/n/${encPath(p)}"><span class="t">${esc(title)}</span>${ctx ? `<span class="c">${esc(ctx)}</span>` : ""}</a>`;
       const sec = (title, items) => `<div class="panel-section"><h4>${esc(title)}<span>${items.length}</span></h4>${items.join("") || `<p class="panel-empty">${esc(t("links.none"))}</p>`}</div>`;
@@ -783,7 +888,8 @@ async function loadPanel() {
         sec(t("links.out"), r.outgoing.filter((l) => !l.embed || l.path?.endsWith(".md")).map((l) =>
           l.path ? item(l.path, l.target, dirOf(l.path))
                  : `<a class="panel-item missing" href="#/new/${encodeURIComponent(l.target)}"><span class="t">${esc(l.target)}</span><span class="c">${esc(t("links.missing"))}</span></a>`)) +
-        sec(t("links.unlinked"), r.unlinked.map((h) => item(h.path, stem(h.path), h.snippet.replace(/[]/g, ""))));
+        sec(t("links.unlinked"), r.unlinked.map((h) => item(h.path, stem(h.path), h.snippet.replace(/[]/g, "")))) +
+        (S.semantic ? sec(t("links.related"), rel.related.map((x) => item(x.path, stem(x.path), x.snippet))) : "");
     } else if (S.tab === "history") {
       const r = await api("GET", "/api/history?path=" + encodeURIComponent(path));
       if (S.path !== path) return;
@@ -877,6 +983,7 @@ const snippetHtml = (s) => esc(s).replace(//g, "<mark>").replace(//g, "</m
 let searchTimer, searchSeq = 0, searchItems = [], searchActive = 0;
 function openSearch() {
   const d = $("#search-dialog");
+  $(".search-hint").textContent = t("search.hint");
   d.showModal();
   const inp = $("#search-input");
   inp.select();
@@ -888,7 +995,14 @@ async function runSearch() {
   let items;
   if (!q) items = [...S.notes].sort((a, b) => b.mtime - a.mtime).slice(0, 12).map((n) => ({ ...n, snippet: "" }));
   else {
-    try { items = (await api("GET", "/api/search?limit=30&q=" + encodeURIComponent(q))).hits; } catch (e) { return fail(e); }
+    try { items = (await api("GET", "/api/search?limit=30&q=" + encodeURIComponent(q))).hits; }
+    catch (e) {
+      if (e.status !== 0) return fail(e);
+      // Offline: match titles and paths of the notes we know about.
+      const f = fold(q);
+      items = S.notes.filter((n) => fold(n.title).includes(f) || fold(n.path).includes(f)).slice(0, 30).map((n) => ({ ...n, snippet: "" }));
+      $(".search-hint").textContent = t("search.offline");
+    }
   }
   if (seq !== searchSeq) return;
   searchItems = items;
@@ -897,7 +1011,7 @@ async function runSearch() {
   $("#search-results").innerHTML = searchItems.length
     ? searchItems.map((h, i) => h.create
         ? `<li class="create" data-i="${i}"><div class="t">${I("note_add")}${esc(t("search.create"))} “${esc(h.create)}”</div></li>`
-        : `<li data-i="${i}"><div class="t">${esc(stem(h.path))}<span class="p">${esc(dirOf(h.path))}</span></div>${h.snippet ? `<div class="s">${snippetHtml(h.snippet)}</div>` : ""}</li>`).join("")
+        : `<li data-i="${i}"><div class="t">${esc(stem(h.path))}<span class="p">${esc(dirOf(h.path))}</span>${h.semantic ? `<span class="badge sem">≈ ${esc(t("search.semantic"))}</span>` : ""}</div>${h.snippet ? `<div class="s">${snippetHtml(h.snippet)}</div>` : ""}</li>`).join("")
     : `<li class="muted">${esc(t("search.none"))}</li>`;
   markActive();
 }
@@ -973,6 +1087,8 @@ async function openSettings() {
   renderSettings();
   $("#settings-dialog").showModal();
   try {
+    renderSemantic();
+    renderOfflineStatus();
     const [info, sess] = await Promise.all([api("GET", "/api/mcp-info"), api("GET", "/api/session")]);
     $("#version").textContent = `MindCrab v${sess.version}`;
     const mask = (s) => s.slice(0, 6) + "•".repeat(12) + s.slice(-4);
@@ -1007,7 +1123,48 @@ async function openSettings() {
     };
   } catch (e) { fail(e); }
 }
-$("#logout").addEventListener("click", async () => { await api("POST", "/api/logout", {}); location.reload(); });
+async function renderSemantic() {
+  const el = $("#semantic-info");
+  try {
+    const st = await api("GET", "/api/embed-status");
+    S.semantic = st.enabled;
+    if (!st.enabled) { el.innerHTML = `<p class="muted">${esc(t("settings.semanticOff"))}</p>`; return; }
+    const pct = st.total ? Math.round((st.done / st.total) * 100) : 100;
+    el.innerHTML = `<p>${esc(t("settings.semanticOn", { model: st.model, done: st.done, total: st.total }))}</p>
+      <div class="progress"><span style="width:${pct}%"></span></div>
+      ${st.error ? `<p class="body-small error-text">${esc(t("settings.semanticError", { err: st.error }))}</p>` : ""}`;
+  } catch { el.textContent = ""; }
+}
+
+function renderOfflineStatus(msg) {
+  const ok = "serviceWorker" in navigator && isSecureContext;
+  $("#offline-download").disabled = !ok;
+  $("#offline-status").textContent = msg ?? (ok ? "" : t("settings.offlineUnsupported"));
+}
+$("#offline-download").addEventListener("click", async () => {
+  const list = [...S.notes];
+  let n = 0;
+  const worker = async () => {
+    while (list.length) {
+      const note = list.shift();
+      try { const r = await fetch("/api/note?path=" + encodeURIComponent(note.path), { credentials: "same-origin" }); if (r.ok) n++; } catch {}
+      renderOfflineStatus(t("settings.offlineProgress", { n, total: S.notes.length }));
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+  await Promise.all(["/api/tree", "/api/tags", "/api/templates"].map((u) => fetch(u).catch(() => {})));
+  renderOfflineStatus(t("settings.offlineDone", { n }));
+});
+$("#offline-clear").addEventListener("click", async () => {
+  if ("caches" in window) await caches.delete("mc-data");
+  renderOfflineStatus(t("settings.offlineCleared"));
+});
+
+$("#logout").addEventListener("click", async () => {
+  await api("POST", "/api/logout", {});
+  if ("caches" in window) await caches.delete("mc-data").catch(() => {});
+  location.reload();
+});
 
 // ------------------------------------------------------------------ routing
 function go(path) {
@@ -1125,8 +1282,10 @@ async function boot() {
   setDrawer(isMobile() ? false : store.get("drawer", true));
   setPanel(isMobile() ? false : store.get("panel", true));
   setMode(S.mode);
-  await Promise.all([loadTree(), loadTags()]);
+  $("#offline-banner").hidden = !S.offline;
+  await Promise.all([loadTree(), loadTags(), api("GET", "/api/embed-status").then((st) => (S.semantic = st.enabled)).catch(() => {})]);
   route();
+  if ("serviceWorker" in navigator && isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
 applyI18n();
