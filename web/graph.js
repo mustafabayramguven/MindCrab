@@ -98,16 +98,36 @@ export class GraphView {
     }
     const n = this.nodes;
     const a = this.alpha;
-    // repulsion (O(n²) is fine for a few thousand notes at this frame budget)
-    for (let i = 0; i < n.length; i++) {
-      for (let j = i + 1; j < n.length; j++) {
-        let dx = n[j].x - n[i].x, dy = n[j].y - n[i].y;
-        let d2 = dx * dx + dy * dy || 0.01;
-        if (d2 > 250000) continue;
-        const f = (900 / d2) * a;
-        dx *= f; dy *= f;
-        n[i].vx -= dx; n[i].vy -= dy;
-        n[j].vx += dx; n[j].vy += dy;
+    // Repulsion only acts within REACH, so bucket nodes into REACH-sized cells and
+    // compare each node with its own and neighbouring cells instead of every node.
+    const REACH = 500, R2 = REACH * REACH;
+    const push = (p, q) => {
+      let dx = q.x - p.x, dy = q.y - p.y;
+      const d2 = dx * dx + dy * dy || 0.01;
+      if (d2 > R2) return;
+      const f = (900 / d2) * a;
+      dx *= f; dy *= f;
+      p.vx -= dx; p.vy -= dy;
+      q.vx += dx; q.vy += dy;
+    };
+    if (n.length < 400) {
+      for (let i = 0; i < n.length; i++) for (let j = i + 1; j < n.length; j++) push(n[i], n[j]);
+    } else {
+      const grid = new Map();
+      for (const p of n) {
+        const k = Math.floor(p.x / REACH) * 65536 + Math.floor(p.y / REACH);
+        const cell = grid.get(k);
+        if (cell) cell.push(p); else grid.set(k, [p]);
+      }
+      // Each unordered pair of cells once: same cell, then 4 of the 8 neighbours.
+      const NB = [[1, -1], [1, 0], [1, 1], [0, 1]];
+      for (const [k, cell] of grid) {
+        for (let i = 0; i < cell.length; i++) for (let j = i + 1; j < cell.length; j++) push(cell[i], cell[j]);
+        const cx = Math.round(k / 65536), cy = k - cx * 65536;
+        for (const [ox, oy] of NB) {
+          const other = grid.get((cx + ox) * 65536 + cy + oy);
+          if (other) for (const p of cell) for (const q of other) push(p, q);
+        }
       }
     }
     for (const [i, j] of this.edges) {

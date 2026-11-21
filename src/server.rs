@@ -144,6 +144,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/remove-line", post(remove_line))
         .route("/preview", get(preview))
         .route("/canvas", get(get_canvas).put(put_canvas))
+        .layer(middleware::from_fn(etag))
         .layer(middleware::from_fn_with_state(shared.clone(), require_auth))
         .route("/login", post(login))
         .route("/logout", post(logout))
@@ -160,8 +161,65 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .layer(DefaultBodyLimit::max(
             crate::vault::MAX_FILE_BYTES + 1024 * 1024,
         ))
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(shared)
+}
+
+/// Largest JSON body the ETag layer buffers; bigger responses pass through untouched.
+const ETAG_MAX: u64 = 32 << 20;
+
+/// Weak ETag over the JSON body for GET requests, answering 304 when the client
+/// already has it — the UI polls the tree and tags, which rarely change.
+async fn etag(req: Request, next: Next) -> Response {
+    if req.method() != axum::http::Method::GET {
+        return next.run(req).await;
+    }
+    let inm = req.headers().get(header::IF_NONE_MATCH).cloned();
+    let res = next.run(req).await;
+    let json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+    let small = axum::body::HttpBody::size_hint(res.body())
+        .upper()
+        .is_some_and(|n| n <= ETAG_MAX);
+    if res.status() != StatusCode::OK || !json || !small || res.headers().contains_key(header::ETAG)
+    {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, ETAG_MAX as usize).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let tag = {
+        use sha2::{Digest, Sha256};
+        format!("W/\"{}\"", hex::encode(&Sha256::digest(&bytes)[..12]))
+    };
+    let tag = HeaderValue::from_str(&tag).expect("hex etag");
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    if inm.as_ref().is_some_and(|v| {
+        v.as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii() == tag.as_bytes())
+    }) {
+        let mut r = StatusCode::NOT_MODIFIED.into_response();
+        r.headers_mut().insert(header::ETAG, tag);
+        r.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-cache"),
+        );
+        return r;
+    }
+    parts.headers.insert(header::ETAG, tag);
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 pub fn shared(app: Arc<App>, cfg: Config) -> Arc<Shared> {
@@ -868,6 +926,8 @@ async fn remove_line(State(st): St, Json(r): Json<LineReq>) -> ApiResult<Json<Va
 struct TasksQ {
     #[serde(default, deserialize_with = "flag")]
     done: bool,
+    /// Only count open tasks due on or before this day (`YYYY-MM-DD`) — for the nav badge.
+    due_count: Option<String>,
 }
 
 /// Accepts `1`, `true`, `yes`, `on` (query-string friendly booleans).
@@ -881,6 +941,9 @@ fn flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
 
 async fn tasks(State(st): St, Query(q): Query<TasksQ>) -> ApiResult<Json<Value>> {
     run(&st, move |app| {
+        if let Some(day) = q.due_count {
+            return Ok(Json(json!({"due": app.idx().count_due_tasks(&day)?})));
+        }
         let f = crate::features::TaskFilter {
             include_done: q.done,
             ..Default::default()

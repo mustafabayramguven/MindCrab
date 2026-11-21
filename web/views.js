@@ -14,9 +14,7 @@ export function createViews(h) {
   // ---------------------------------------------------------------- tasks
   async function refreshTaskBadge() {
     try {
-      const { tasks } = await api("GET", "/api/tasks");
-      const today = todayIso();
-      const n = tasks.filter((x) => (x.due || x.scheduled) && (x.due || x.scheduled) <= today).length;
+      const { due: n } = await api("GET", "/api/tasks?due_count=" + todayIso());
       const b = $("#tasks-badge");
       b.hidden = !n;
       b.textContent = n;

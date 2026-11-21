@@ -136,6 +136,14 @@ impl App {
     }
 
     pub fn with_embedder(mut self, e: Option<Embedder>) -> Self {
+        let idx = self.index.get_mut().unwrap_or_else(|p| p.into_inner());
+        idx.chunking = e.is_some();
+        if e.is_none() {
+            // Chunks waiting for a vector would never get one.
+            if let Err(err) = idx.drop_pending_chunks() {
+                tracing::warn!("dropping stale chunks: {err:#}");
+            }
+        }
         self.embedder = e;
         self
     }
@@ -177,21 +185,27 @@ impl App {
     pub fn sync(&self, force: bool) -> Result<(usize, usize)> {
         let _w = self.wlock();
         let (notes, files, dirs) = self.vault.scan();
-        let mut idx = self.idx();
+        let idx = self.idx();
         let force = force || idx.needs_reindex;
-        let mut changed = 0;
+        let chunking = idx.chunking;
         let on_disk: std::collections::HashSet<&str> =
             notes.iter().map(|e| e.rel.as_str()).collect();
+        let mut todo = Vec::new();
         for e in &notes {
             let state = idx.note_state(&e.rel)?;
-            if !force && matches!(state, Some((_, s, m)) if s == e.size as i64 && m == e.mtime) {
-                continue;
-            }
-            let content = self.vault.read(&e.rel)?;
-            if idx.upsert(&e.rel, &content, e.size as i64, e.mtime, "external")? {
-                changed += 1;
+            if force || !matches!(state, Some((_, s, m)) if s == e.size as i64 && m == e.mtime) {
+                todo.push(e);
             }
         }
+        // Reading and parsing is the slow part and needs no database: do it in parallel
+        // (the write lock keeps other writers out meanwhile), then store in batches.
+        drop(idx);
+        let mut changed = 0;
+        for batch in todo.chunks(512) {
+            let prepared = self.prepare_parallel(batch, chunking);
+            changed += self.idx().upsert_many(&prepared, "external")?;
+        }
+        let mut idx = self.idx();
         let mut removed = 0;
         for p in idx.all_paths()? {
             if !on_disk.contains(p.as_str()) {
@@ -221,6 +235,45 @@ impl App {
     }
 
     /// Re-syncs a single path after a filesystem event.
+    fn prepare_parallel(
+        &self,
+        entries: &[&crate::vault::Entry],
+        chunking: bool,
+    ) -> Vec<crate::index::Prepared> {
+        let threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(1, 8);
+        let per = entries.len().div_ceil(threads).max(1);
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = entries
+                .chunks(per)
+                .map(|part| {
+                    sc.spawn(move || {
+                        part.iter()
+                            .filter_map(|e| match self.vault.read(&e.rel) {
+                                Ok(c) => Some(crate::index::prepare(
+                                    &e.rel,
+                                    c,
+                                    e.size as i64,
+                                    e.mtime,
+                                    chunking,
+                                )),
+                                Err(err) => {
+                                    tracing::warn!("reading {}: {err:#}", e.rel);
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    }
+
     pub fn sync_path(&self, rel: &str) -> Result<()> {
         let _w = self.wlock();
         let abs = self.vault.abs(rel);
@@ -380,7 +433,13 @@ impl App {
             idx.add_folder(dir)?;
         }
         if log && changed && source != "seed" {
-            let rev = idx.last_rev_for(path)?.filter(|r| Some(*r) != rev_before);
+            let rev = idx.last_rev_for(path)?;
+            // A coalesced web autosave keeps the revision from the start of the session.
+            let rev = if source == "web" {
+                rev
+            } else {
+                rev.filter(|r| Some(*r) != rev_before)
+            };
             idx.log_activity(
                 source,
                 if existed { "update" } else { "create" },

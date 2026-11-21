@@ -275,6 +275,10 @@ All options are flags or environment variables.
 
 Commands: `mindcrab serve` (default) · `mindcrab mcp` (stdio) · `mindcrab reindex` · `mindcrab token`.
 
+Boolean variables accept `1/0`, `true/false`, `yes/no`, `on/off`.
+
+**Performance:** a 5,000-note vault (20 MB) is indexed in under a second on first start (files are parsed in parallel and written in one transaction). Responses are compressed (brotli/gzip) and carry ETags, so the UI's background refresh usually gets a tiny `304`. Autosaves from one editing session share a single history entry (a new snapshot is taken after 5 minutes, or when an AI or another app touches the note).
+
 **Backups:** the vault folder *is* the backup — notes are plain files. `.mindcrab/index.db` holds the search index and version history; copy it too if you want to keep history. Add `.mindcrab/` and `.trash/` to `.gitignore` if the vault is a git repo.
 
 ## Security notes

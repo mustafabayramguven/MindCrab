@@ -18,6 +18,7 @@ mod web;
 
 use anyhow::Result;
 use app::{App, Settings};
+use clap::builder::BoolishValueParser;
 use clap::{Parser, Subcommand};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -52,13 +53,13 @@ struct Cli {
     )]
     mcp_token: Option<String>,
     /// Only expose read tools over MCP.
-    #[arg(long, env = "MINDCRAB_MCP_READ_ONLY", global = true)]
+    #[arg(long, env = "MINDCRAB_MCP_READ_ONLY", global = true, value_parser = BoolishValueParser::new())]
     mcp_read_only: bool,
     /// Facts saved with `remember` over the main MCP token wait for approval in the web UI.
-    #[arg(long, env = "MINDCRAB_REVIEW_REMEMBER", global = true)]
+    #[arg(long, env = "MINDCRAB_REVIEW_REMEMBER", global = true, value_parser = BoolishValueParser::new())]
     review_remember: bool,
     /// Mark the login cookie Secure (set this when served over HTTPS).
-    #[arg(long, env = "MINDCRAB_COOKIE_SECURE", global = true)]
+    #[arg(long, env = "MINDCRAB_COOKIE_SECURE", global = true, value_parser = BoolishValueParser::new())]
     cookie_secure: bool,
     #[arg(
         long,
@@ -130,7 +131,7 @@ struct Cli {
     )]
     embed_min_score: f32,
     /// Don't create starter notes in an empty vault.
-    #[arg(long, env = "MINDCRAB_NO_SEED", global = true)]
+    #[arg(long, env = "MINDCRAB_NO_SEED", global = true, value_parser = BoolishValueParser::new())]
     no_seed: bool,
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -186,7 +187,7 @@ fn main() -> Result<()> {
     };
     if matches!(cli.cmd, Some(Cmd::Reindex)) {
         // Re-reads every file; revisions are kept.
-        let app = App::open(&cli.vault, cli.data.clone(), settings)?;
+        let app = App::open(&cli.vault, cli.data.clone(), settings)?.with_embedder(embedder);
         let (c, r) = app.sync(true)?;
         eprintln!("reindexed {c} notes, removed {r}");
         return Ok(());

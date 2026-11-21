@@ -14,10 +14,53 @@ pub const SNIP_END: char = '\u{E001}';
 const MAX_REVISIONS_PER_NOTE: i64 = 100;
 
 /// Bump when derived data changes shape; forces a full re-read of the vault.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// Web autosaves within this window share one revision (the state before the editing session).
+pub const COALESCE_MS: i64 = 5 * 60 * 1000;
+
+/// Everything derived from one note's text — computed without touching the database,
+/// so many notes can be prepared in parallel.
+pub struct Prepared {
+    pub path: String,
+    pub content: String,
+    pub hash: String,
+    pub size: i64,
+    pub mtime: i64,
+    parsed: Parsed,
+    fm_json: String,
+    private: bool,
+    tasks: Vec<crate::tasks::Task>,
+    chunks: Option<Vec<String>>,
+}
+
+pub fn prepare(path: &str, content: String, size: i64, mtime: i64, chunking: bool) -> Prepared {
+    let parsed = note::parse(path, &content);
+    let fm_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_else(|_| "{}".into());
+    let private = crate::scope::frontmatter_private(&parsed.frontmatter);
+    let tasks = crate::tasks::parse(&content);
+    let chunks = chunking.then(|| crate::embed::chunk(&parsed.title, &parsed.body));
+    Prepared {
+        path: path.to_string(),
+        hash: hash(&content),
+        content,
+        size,
+        mtime,
+        parsed,
+        fm_json,
+        private,
+        tasks,
+        chunks,
+    }
+}
 
 pub struct Index {
     pub(crate) conn: Connection,
+    /// Store text chunks for semantic search (only when an embedder is configured).
+    pub chunking: bool,
+    /// Bumped when the set of note/file paths changes (invalidates the link resolver cache).
+    paths_gen: std::cell::Cell<u64>,
+    resolver_cache: std::cell::RefCell<Option<(u64, std::sync::Arc<Resolver>)>>,
     /// Set when the on-disk schema is older than this build (full reindex needed).
     pub needs_reindex: bool,
     /// Bumped whenever stored vectors may have changed (for the in-memory vector cache).
@@ -104,6 +147,9 @@ impl Index {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "cache_size", -16000)?; // ~16 MB page cache
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "mmap_size", 64 * 1024 * 1024)?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS notes(
@@ -132,7 +178,6 @@ impl Index {
                 tag TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS tags_tag ON tags(tag);
-            CREATE INDEX IF NOT EXISTS tags_path ON tags(path);
             CREATE TABLE IF NOT EXISTS files(
                 path TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -217,6 +262,21 @@ impl Index {
                 [],
             )?;
         }
+        if !has_col("links", "stem")? {
+            conn.execute(
+                "ALTER TABLE links ADD COLUMN stem TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS links_stem ON links(stem);
+             -- Listings read only metadata; without these they would page through every note body.
+             CREATE INDEX IF NOT EXISTS notes_meta ON notes(path, title, mtime, size, private);
+             CREATE INDEX IF NOT EXISTS notes_recent ON notes(mtime DESC, path, title, size);
+             CREATE INDEX IF NOT EXISTS notes_private ON notes(path) WHERE private = 1;
+             CREATE INDEX IF NOT EXISTS tags_path_tag ON tags(path, tag);
+             DROP INDEX IF EXISTS tags_path;",
+        )?;
         let ver: i64 = conn
             .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
                 r.get::<_, String>(0)
@@ -227,6 +287,9 @@ impl Index {
         let empty: i64 = conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))?;
         let mut me = Self {
             conn,
+            chunking: false,
+            paths_gen: std::cell::Cell::new(0),
+            resolver_cache: std::cell::RefCell::new(None),
             vec_gen: 0,
             needs_reindex: ver < SCHEMA_VERSION,
         };
@@ -266,8 +329,60 @@ impl Index {
         mtime: i64,
         source: &str,
     ) -> Result<bool> {
-        let new_hash = hash(content);
+        // Cheap no-op check before parsing anything.
+        if !self.needs_reindex {
+            let old: Option<String> = self
+                .conn
+                .query_row("SELECT hash FROM notes WHERE path=?1", [path], |r| r.get(0))
+                .optional()?;
+            if old.as_deref() == Some(hash(content).as_str()) {
+                self.conn.execute(
+                    "UPDATE notes SET size=?2, mtime=?3 WHERE path=?1",
+                    params![path, size, mtime],
+                )?;
+                return Ok(false);
+            }
+        }
+        let p = prepare(path, content.to_string(), size, mtime, self.chunking);
         let tx = self.conn.transaction()?;
+        let (changed, new_path) = Self::apply(&tx, &p, source, self.needs_reindex)?;
+        tx.commit()?;
+        self.after_apply(changed, new_path);
+        Ok(changed)
+    }
+
+    /// Indexes many prepared notes in one transaction (initial scan, rescans).
+    pub fn upsert_many(&mut self, items: &[Prepared], source: &str) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut changed = 0;
+        let mut new_paths = false;
+        for p in items {
+            let (c, n) = Self::apply(&tx, p, source, self.needs_reindex)?;
+            changed += c as usize;
+            new_paths |= n;
+        }
+        tx.commit()?;
+        self.after_apply(changed > 0, new_paths);
+        Ok(changed)
+    }
+
+    fn after_apply(&mut self, changed: bool, new_path: bool) {
+        if changed {
+            self.vec_gen += 1;
+        }
+        if new_path {
+            self.paths_gen.set(self.paths_gen.get() + 1);
+        }
+    }
+
+    /// Writes one prepared note. Returns (changed, path was new).
+    fn apply(
+        tx: &rusqlite::Transaction,
+        p: &Prepared,
+        source: &str,
+        force: bool,
+    ) -> Result<(bool, bool)> {
+        let path = p.path.as_str();
         let old: Option<(String, String)> = tx
             .query_row(
                 "SELECT hash, content FROM notes WHERE path=?1",
@@ -276,36 +391,42 @@ impl Index {
             )
             .optional()?;
         if let Some((old_hash, old_content)) = &old {
-            if *old_hash == new_hash && !self.needs_reindex {
+            if *old_hash == p.hash && !force {
                 tx.execute(
                     "UPDATE notes SET size=?2, mtime=?3 WHERE path=?1",
-                    params![path, size, mtime],
+                    params![path, p.size, p.mtime],
                 )?;
-                tx.commit()?;
-                return Ok(false);
+                return Ok((false, false));
             }
-            if !old_content.is_empty() && *old_hash != new_hash {
+            if !old_content.is_empty() && *old_hash != p.hash && !coalesce(tx, path, source)? {
                 tx.execute(
                     "INSERT INTO revisions(path, content, hash, created_at, source) VALUES(?1,?2,?3,?4,?5)",
                     params![path, old_content, old_hash, now_ms(), source],
                 )?;
-                prune_revisions(&tx, path)?;
+                prune_revisions(tx, path)?;
             }
         }
-        let p: Parsed = note::parse(path, content);
-        let fm = serde_json::to_string(&p.frontmatter)?;
-        let private = crate::scope::frontmatter_private(&p.frontmatter);
+        let pa = &p.parsed;
         tx.execute(
             "INSERT INTO notes(path,title,hash,size,mtime,frontmatter,content,private) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(path) DO UPDATE SET title=?2,hash=?3,size=?4,mtime=?5,frontmatter=?6,content=?7,private=?8",
-            params![path, p.title, new_hash, size, mtime, fm, content, private],
+            params![path, pa.title, p.hash, p.size, p.mtime, p.fm_json, p.content, p.private],
         )?;
-        tx.execute("DELETE FROM tasks WHERE path=?1", [path])?;
+        if old.is_some() {
+            tx.execute("DELETE FROM tasks WHERE path=?1", [path])?;
+            tx.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
+            tx.execute("DELETE FROM links WHERE src=?1", [path])?;
+            tx.execute("DELETE FROM tags WHERE path=?1", [path])?;
+        }
+        tx.execute(
+            "INSERT INTO notes_fts(path,title,body,tags) VALUES(?1,?2,?3,?4)",
+            params![path, pa.title, pa.body, pa.tags.join(" ")],
+        )?;
         {
-            let mut ins = tx.prepare(
+            let mut ins = tx.prepare_cached(
                 "INSERT INTO tasks(path,line,text,raw,done,due,scheduled,done_date,priority) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             )?;
-            for t in crate::tasks::parse(content) {
+            for t in &p.tasks {
                 ins.execute(params![
                     path,
                     t.line as i64,
@@ -318,51 +439,49 @@ impl Index {
                     t.priority
                 ])?;
             }
-        }
-        tx.execute("DELETE FROM notes_fts WHERE path=?1", [path])?;
-        tx.execute(
-            "INSERT INTO notes_fts(path,title,body,tags) VALUES(?1,?2,?3,?4)",
-            params![path, p.title, p.body, p.tags.join(" ")],
-        )?;
-        tx.execute("DELETE FROM links WHERE src=?1", [path])?;
-        tx.execute("DELETE FROM tags WHERE path=?1", [path])?;
-        {
-            let mut ins = tx.prepare("INSERT INTO links(src,key,raw,embed) VALUES(?1,?2,?3,?4)")?;
-            for l in &p.links {
-                ins.execute(params![path, l.key, l.raw, l.embed])?;
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO links(src,key,raw,embed,stem) VALUES(?1,?2,?3,?4,?5)",
+            )?;
+            for l in &pa.links {
+                let stem = l.key.rsplit('/').next().unwrap_or(&l.key);
+                ins.execute(params![path, l.key, l.raw, l.embed, stem])?;
             }
-            let mut ins = tx.prepare("INSERT INTO tags(path,tag) VALUES(?1,?2)")?;
-            for t in &p.tags {
+            let mut ins = tx.prepare_cached("INSERT INTO tags(path,tag) VALUES(?1,?2)")?;
+            for t in &pa.tags {
                 ins.execute(params![path, t])?;
             }
-            // Chunks for semantic search: keep vectors of unchanged chunks.
-            let chunks = crate::embed::chunk(&p.title, &p.body);
-            let mut old_hashes: HashMap<i64, String> = HashMap::new();
-            let mut q = tx.prepare("SELECT idx, hash FROM chunks WHERE path=?1")?;
-            for row in q.query_map([path], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })? {
-                let (i, h) = row?;
-                old_hashes.insert(i, h);
-            }
-            let mut put = tx.prepare(
-                "INSERT INTO chunks(path,idx,hash,text,vec) VALUES(?1,?2,?3,?4,NULL)
-                 ON CONFLICT(path,idx) DO UPDATE SET hash=?3, text=?4, vec=NULL",
+        }
+        if let Some(chunks) = &p.chunks {
+            write_chunks(tx, path, chunks)?;
+        }
+        Ok((true, old.is_none()))
+    }
+
+    /// Creates chunks for notes that have none (semantic search was just turned on).
+    pub fn rechunk_missing(&mut self) -> Result<usize> {
+        let rows: Vec<(String, String)> = {
+            let mut st = self.conn.prepare(
+                "SELECT path, content FROM notes WHERE path NOT IN (SELECT DISTINCT path FROM chunks)",
             )?;
-            for (i, c) in chunks.iter().enumerate() {
-                let h = hash(c);
-                if old_hashes.get(&(i as i64)) != Some(&h) {
-                    put.execute(params![path, i as i64, h, c])?;
-                }
-            }
-            tx.execute(
-                "DELETE FROM chunks WHERE path=?1 AND idx>=?2",
-                params![path, chunks.len() as i64],
-            )?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?
+        };
+        let tx = self.conn.transaction()?;
+        for (path, content) in &rows {
+            let p = note::parse(path, content);
+            write_chunks(&tx, path, &crate::embed::chunk(&p.title, &p.body))?;
         }
         tx.commit()?;
         self.vec_gen += 1;
-        Ok(true)
+        Ok(rows.len())
+    }
+
+    /// Without an embedder, unembedded chunks are dead weight.
+    pub fn drop_pending_chunks(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM chunks WHERE path IN (SELECT DISTINCT path FROM chunks WHERE vec IS NULL)",
+            [],
+        )?)
     }
 
     /// Removes a note from the index, keeping its last content as a revision.
@@ -385,6 +504,7 @@ impl Index {
         tx.execute("DELETE FROM notes WHERE path=?1", [path])?;
         tx.commit()?;
         self.vec_gen += 1;
+        self.paths_gen.set(self.paths_gen.get() + 1);
         Ok(())
     }
 
@@ -401,17 +521,29 @@ impl Index {
 
     pub fn upsert_file(&self, path: &str, size: i64, mtime: i64) -> Result<()> {
         let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
-        self.conn.execute(
-            "INSERT INTO files(path,name,size,mtime) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(path) DO UPDATE SET size=?3, mtime=?4",
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO files(path,name,size,mtime) VALUES(?1,?2,?3,?4)",
             params![path, name, size, mtime],
         )?;
+        if added > 0 {
+            self.paths_gen.set(self.paths_gen.get() + 1);
+        } else {
+            self.conn.execute(
+                "UPDATE files SET size=?2, mtime=?3 WHERE path=?1 AND (size!=?2 OR mtime!=?3)",
+                params![path, size, mtime],
+            )?;
+        }
         Ok(())
     }
 
     pub fn remove_file(&self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM files WHERE path=?1", [path])?;
+        if self
+            .conn
+            .execute("DELETE FROM files WHERE path=?1", [path])?
+            > 0
+        {
+            self.paths_gen.set(self.paths_gen.get() + 1);
+        }
         Ok(())
     }
 
@@ -456,19 +588,19 @@ impl Index {
     }
 
     pub fn all_paths(&self) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT path FROM notes")?;
+        let mut st = self.conn.prepare("SELECT path FROM notes ORDER BY path")?;
         Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
     }
 
     pub fn all_file_paths(&self) -> Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT path FROM files")?;
+        let mut st = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
         Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
     }
 
     fn tags_map(&self) -> Result<HashMap<String, Vec<String>>> {
         let mut st = self
             .conn
-            .prepare("SELECT path, tag FROM tags ORDER BY tag")?;
+            .prepare("SELECT path, tag FROM tags ORDER BY path, tag")?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
             let (p, t) = row?;
@@ -489,10 +621,15 @@ impl Index {
             "path COLLATE NOCASE"
         };
         let sql = format!(
-            "SELECT path,title,mtime,size FROM notes WHERE (?1 = '' OR path LIKE ?1 || '/%') ORDER BY {order} LIMIT ?2"
+            "SELECT path,title,mtime,size,{TAGS_SQL} FROM notes n WHERE (?1 = '' OR path LIKE ?1 || '/%') ORDER BY {order} LIMIT ?2"
         );
+        let big = limit > 500;
+        let sql = if big {
+            sql.replace(&format!(",{TAGS_SQL}"), ",NULL")
+        } else {
+            sql
+        };
         let mut st = self.conn.prepare(&sql)?;
-        let tags = self.tags_map()?;
         let folder = folder.unwrap_or("").trim_matches('/');
         let rows = st
             .query_map(params![folder, limit as i64], |r| {
@@ -501,14 +638,19 @@ impl Index {
                     title: r.get(1)?,
                     mtime: r.get(2)?,
                     size: r.get(3)?,
-                    tags: vec![],
+                    tags: split_tags(r.get(4)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        if !big {
+            return Ok(rows);
+        }
+        // One pass over the tag table beats thousands of correlated lookups.
+        let mut tags = self.tags_map()?;
         Ok(rows
             .into_iter()
             .map(|mut m| {
-                m.tags = tags.get(&m.path).cloned().unwrap_or_default();
+                m.tags = tags.remove(&m.path).unwrap_or_default();
                 m
             })
             .collect())
@@ -523,7 +665,6 @@ impl Index {
     /// Full-text search. Supports `tag:x`, `path:folder` and `"exact phrase"`.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let parsed = parse_query(query);
-        let tags = self.tags_map()?;
         let mut hits = Vec::new();
 
         if parsed.fts.is_empty() {
@@ -551,24 +692,30 @@ impl Index {
         }
 
         let sql = format!(
-            "SELECT f.path, n.title, snippet(notes_fts, 2, '{SNIP_START}', '{SNIP_END}', '…', 16), n.mtime
+            "SELECT f.path, n.title, snippet(notes_fts, 2, '{SNIP_START}', '{SNIP_END}', '…', 16), n.mtime, {TAGS_SQL}
              FROM notes_fts f JOIN notes n ON n.path = f.path
              WHERE notes_fts MATCH ?1 AND (?2 = '' OR f.path LIKE ?2 || '/%')
              ORDER BY bm25(notes_fts, 0.0, 8.0, 1.0, 4.0) LIMIT ?3"
         );
         let mut st = self.conn.prepare(&sql)?;
         let folder = parsed.folder.clone().unwrap_or_default();
-        let rows = st.query_map(params![parsed.fts, folder, (limit * 4) as i64], |r| {
+        // Over-fetch only when tag filters may drop rows: each row's snippet is costly.
+        let fetch = if parsed.tags.is_empty() {
+            limit
+        } else {
+            limit * 4
+        };
+        let rows = st.query_map(params![parsed.fts, folder, fetch as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, i64>(3)?,
+                split_tags(r.get(4)?),
             ))
         })?;
         for row in rows {
-            let (path, title, snippet, mtime) = row?;
-            let t = tags.get(&path).cloned().unwrap_or_default();
+            let (path, title, snippet, mtime, t) = row?;
             if !parsed
                 .tags
                 .iter()
@@ -601,7 +748,14 @@ impl Index {
     }
 
     /// Lookup tables for link resolution: full key -> path, stem -> paths.
-    fn resolver(&self) -> Result<Resolver> {
+    /// Link resolver, rebuilt only when the set of paths changed.
+    fn resolver(&self) -> Result<std::sync::Arc<Resolver>> {
+        let cur = self.paths_gen.get();
+        if let Some((g, r)) = &*self.resolver_cache.borrow()
+            && *g == cur
+        {
+            return Ok(r.clone());
+        }
         let mut r = Resolver::default();
         for p in self.all_paths()? {
             r.by_key.insert(note::normalize_key(&p), p.clone());
@@ -616,6 +770,8 @@ impl Index {
             r.files_by_key.insert(p.to_lowercase(), p.clone());
             r.files_by_name.entry(name).or_default().push(p);
         }
+        let r = std::sync::Arc::new(r);
+        *self.resolver_cache.borrow_mut() = Some((cur, r.clone()));
         Ok(r)
     }
 
@@ -623,7 +779,7 @@ impl Index {
         Ok(self.resolver()?.resolve(src, target))
     }
 
-    pub fn resolver_snapshot(&self) -> Result<Resolver> {
+    pub fn resolver_snapshot(&self) -> Result<std::sync::Arc<Resolver>> {
         self.resolver()
     }
 
@@ -652,15 +808,15 @@ impl Index {
 
     pub fn backlinks(&self, path: &str) -> Result<Vec<BackLink>> {
         let r = self.resolver()?;
-        let full = note::normalize_key(path);
         let stem = note::stem(path).to_lowercase();
+        // Every link that could resolve here ends in this note's file name (indexed column).
         let mut st = self.conn.prepare(
             "SELECT DISTINCT l.src, l.raw, n.title, n.content FROM links l JOIN notes n ON n.path = l.src
-             WHERE (l.key = ?1 OR l.key = ?2 OR l.key LIKE '%/' || ?2) AND l.src != ?3",
+             WHERE l.stem = ?1 AND l.src != ?2",
         )?;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for row in st.query_map(params![full, stem, path], |x| {
+        for row in st.query_map(params![stem, path], |x| {
             Ok((
                 x.get::<_, String>(0)?,
                 x.get::<_, String>(1)?,
@@ -728,10 +884,9 @@ impl Index {
                 nodes[idx[&dst]].degree += 1;
             }
         }
-        Ok(Graph {
-            nodes,
-            edges: edges.into_iter().collect(),
-        })
+        let mut edges: Vec<_> = edges.into_iter().collect();
+        edges.sort_unstable(); // stable output → stable ETag
+        Ok(Graph { nodes, edges })
     }
 
     // ------------------------------------------------------------ vectors
@@ -864,6 +1019,59 @@ impl Index {
             )
             .optional()?)
     }
+}
+
+/// True when the latest revision of `path` came from the same web editing session,
+/// so another autosave doesn't need its own snapshot.
+fn coalesce(tx: &rusqlite::Transaction, path: &str, source: &str) -> Result<bool> {
+    if source != "web" {
+        return Ok(false);
+    }
+    let last: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT source, created_at FROM revisions WHERE path=?1 ORDER BY id DESC LIMIT 1",
+            [path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(last, Some((s, t)) if s == "web" && now_ms() - t < COALESCE_MS))
+}
+
+/// Stores chunks, keeping vectors of chunks whose text didn't change.
+fn write_chunks(tx: &rusqlite::Transaction, path: &str, chunks: &[String]) -> Result<()> {
+    let mut old_hashes: HashMap<i64, String> = HashMap::new();
+    {
+        let mut q = tx.prepare_cached("SELECT idx, hash FROM chunks WHERE path=?1")?;
+        for row in q.query_map([path], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (i, h) = row?;
+            old_hashes.insert(i, h);
+        }
+    }
+    let mut put = tx.prepare_cached(
+        "INSERT INTO chunks(path,idx,hash,text,vec) VALUES(?1,?2,?3,?4,NULL)
+         ON CONFLICT(path,idx) DO UPDATE SET hash=?3, text=?4, vec=NULL",
+    )?;
+    for (i, c) in chunks.iter().enumerate() {
+        let h = hash(c);
+        if old_hashes.get(&(i as i64)) != Some(&h) {
+            put.execute(params![path, i as i64, h, c])?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM chunks WHERE path=?1 AND idx>=?2",
+        params![path, chunks.len() as i64],
+    )?;
+    Ok(())
+}
+
+/// Sorted tags of note `n`, joined with U+001F.
+const TAGS_SQL: &str = "(SELECT group_concat(tag, char(31)) FROM (SELECT tag FROM tags t WHERE t.path = n.path ORDER BY tag))";
+
+fn split_tags(s: Option<String>) -> Vec<String> {
+    s.map(|s| s.split('\u{1f}').map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 fn prune_revisions(tx: &rusqlite::Transaction, path: &str) -> Result<()> {
@@ -1050,6 +1258,73 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let i = Index::open(&d.path().join("i.db")).unwrap();
         (d, i)
+    }
+
+    #[test]
+    fn web_autosaves_share_a_revision() {
+        let (_d, mut i) = idx();
+        i.upsert("a.md", "v1", 1, 1, "web").unwrap();
+        for v in ["v2", "v3", "v4"] {
+            i.upsert("a.md", v, 1, 1, "web").unwrap();
+        }
+        assert_eq!(
+            i.revisions("a.md").unwrap().len(),
+            1,
+            "one snapshot per editing session"
+        );
+        i.upsert("a.md", "v5", 1, 1, "mcp:claude").unwrap();
+        i.upsert("a.md", "v6", 1, 1, "web").unwrap();
+        let revs = i.revisions("a.md").unwrap();
+        assert_eq!(
+            revs.len(),
+            3,
+            "other sources always snapshot, and break the session"
+        );
+    }
+
+    #[test]
+    fn resolver_cache_follows_new_paths() {
+        let (_d, mut i) = idx();
+        i.upsert("src.md", "see [[Later]]", 1, 1, "t").unwrap();
+        assert_eq!(i.resolve_link("src.md", "Later").unwrap(), None);
+        i.upsert("deep/Later.md", "x", 1, 1, "t").unwrap();
+        assert_eq!(
+            i.resolve_link("src.md", "Later").unwrap().as_deref(),
+            Some("deep/Later.md")
+        );
+        assert_eq!(i.backlinks("deep/Later.md").unwrap().len(), 1);
+        i.remove("deep/Later.md", "t").unwrap();
+        assert_eq!(i.resolve_link("src.md", "Later").unwrap(), None);
+    }
+
+    #[test]
+    fn batch_indexing_matches_single() {
+        let (_d, mut i) = idx();
+        let items: Vec<_> = (0..50)
+            .map(|n| {
+                prepare(
+                    &format!("n{n}.md"),
+                    format!("# N{n}\n#t{} [[n{}]] - [ ] task", n % 3, (n + 1) % 50),
+                    1,
+                    1,
+                    false,
+                )
+            })
+            .collect();
+        assert_eq!(i.upsert_many(&items, "external").unwrap(), 50);
+        assert_eq!(i.count().unwrap(), 50);
+        assert_eq!(i.backlinks("n7.md").unwrap().len(), 1);
+        assert_eq!(i.search("tag:t1", 100).unwrap().len(), 17);
+        assert_eq!(
+            i.list(None, false, 3).unwrap()[0].tags,
+            vec!["t0".to_string()]
+        );
+        assert_eq!(i.count_due_tasks("2099-01-01").unwrap(), 0);
+        assert_eq!(
+            i.upsert_many(&items, "external").unwrap(),
+            0,
+            "unchanged notes are skipped"
+        );
     }
 
     #[test]

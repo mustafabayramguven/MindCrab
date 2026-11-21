@@ -1,9 +1,7 @@
 // MindCrab web UI — vanilla ES modules, no build step.
 import { ICONS } from "/icons.js";
 import { t, applyI18n, LANG } from "/i18n.js";
-import { GraphView } from "/graph.js";
 import { createViews } from "/views.js";
-import { CanvasEditor } from "/canvas.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -44,8 +42,16 @@ const I = (name, cls = "") => `<i data-icon="${name}" class="${cls}">${icon(name
 class ApiError extends Error {
   constructor(status, msg) { super(msg); this.status = status; }
 }
+// Last ETag-tagged answer per GET url: the server replies 304 when nothing changed,
+// and callers get the very same object back (so `data === previous` means "unchanged").
+// Only read-only listings that are polled or reopened often; their objects are never mutated.
+const etags = new Map();
+const CONDITIONAL = /^\/api\/(tree|tags|graph|tasks)(\?|$)/;
 async function api(method, url, body, opts = {}) {
   const init = { method, headers: {}, credentials: "same-origin" };
+  const conditional = method === "GET" && CONDITIONAL.test(url);
+  const memo = conditional ? etags.get(url) : undefined;
+  if (memo) init.headers["if-none-match"] = memo.tag;
   if (body !== undefined) {
     if (opts.raw) init.body = body;
     else { init.body = JSON.stringify(body); init.headers["content-type"] = "application/json"; }
@@ -53,10 +59,17 @@ async function api(method, url, body, opts = {}) {
   let res;
   try { res = await fetch(url, init); } catch (e) { setOffline(true); throw new ApiError(0, e.message); }
   if (res.status === 401 && !opts.noAuthRedirect) { showLogin(); throw new ApiError(401, "login required"); }
+  if (res.status === 304 && memo) { if (S.offline) setOffline(!navigator.onLine); return memo.data; }
   const data = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
   if (res.status === 503 && data?.offline) { setOffline(true); throw new ApiError(0, "offline"); }
   if (!res.ok) throw new ApiError(res.status, data?.error || res.statusText);
   if (S.offline && method === "GET" && res.headers.get("date")) setOffline(!navigator.onLine);
+  const tag = conditional && res.headers.get("etag");
+  if (tag) {
+    etags.delete(url);
+    etags.set(url, { tag, data });
+    if (etags.size > 64) etags.delete(etags.keys().next().value);
+  }
   return data;
 }
 
@@ -273,6 +286,8 @@ function showPage(name, title) {
 // ------------------------------------------------------------------ tree
 async function loadTree() {
   const data = await api("GET", "/api/tree");
+  if (data === S.treeData) return data; // 304: nothing changed
+  S.treeData = data;
   S.notes = data.notes;
   S.folders = data.folders;
   S.canvases = data.canvases || [];
@@ -416,6 +431,7 @@ function folderMenu(anchor, folder) {
 
 async function loadTags() {
   const { tags } = await api("GET", "/api/tags");
+  if (tags === S.tags) return;
   S.tags = tags;
   $("#tag-list").innerHTML = tags.length
     ? tags.map((x) => `<a class="chip" href="#/tag/${encodeURIComponent(x.tag)}">#${esc(x.tag)} <span class="count">${x.count}</span></a>`).join("")
@@ -679,6 +695,8 @@ async function showCanvas(path) {
   highlightTree();
   renderTree();
   if (isMobile()) setDrawer(false);
+  const { CanvasEditor } = await import("/canvas.js");
+  if (S.canvasPath !== path) return; // navigated away while loading
   S.canvas = new CanvasEditor($("#canvas-view"), path, { api, I, t, esc, go, fail, dialogPrompt, enhance });
   try { await S.canvas.load(); } catch (e) { fail(e); }
 }
@@ -1115,7 +1133,10 @@ async function showGraph() {
   if (panelOpen()) loadPanel();
   $("#note-title").textContent = t("nav.graph");
   document.title = `${t("nav.graph")} · MindCrab`;
-  if (!S.graph) S.graph = new GraphView($("#graph-canvas"), { onOpen: (p) => go(p) });
+  if (!S.graph) {
+    const { GraphView } = await import("/graph.js");
+    S.graph ??= new GraphView($("#graph-canvas"), { onOpen: (p) => go(p) });
+  }
   const data = await api("GET", "/api/graph");
   S.graph.setData(data, { current: store.get("last", null), local: $("#graph-local").checked, orphans: $("#graph-orphans").checked });
   if (isMobile()) setDrawer(false);

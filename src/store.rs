@@ -105,6 +105,28 @@ impl Index {
         rev: Option<i64>,
         detail: Option<&str>,
     ) -> Result<()> {
+        if source == "web" && kind == "update" {
+            // Autosaves of one editing session collapse into a single entry.
+            let last: Option<(i64, String, String, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT id, source, kind, ts FROM activity WHERE path=?1 ORDER BY id DESC LIMIT 1",
+                    [path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((id, s, k, ts)) = last
+                && s == "web"
+                && (k == "update" || k == "create")
+                && now_ms() - ts < crate::index::COALESCE_MS
+            {
+                self.conn.execute(
+                    "UPDATE activity SET ts=?2 WHERE id=?1",
+                    params![id, now_ms()],
+                )?;
+                return Ok(());
+            }
+        }
         let floor = self.max_rev()?;
         self.conn.execute(
             "INSERT INTO activity(ts,source,kind,path,rev,floor,detail) VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -309,6 +331,14 @@ impl Index {
     }
 
     // ------------------------------------------------------------ tasks
+
+    pub fn count_due_tasks(&self, day: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE done = 0 AND COALESCE(due, scheduled) <= ?1",
+            [day],
+            |r| r.get(0),
+        )?)
+    }
 
     pub fn tasks(&self, include_done: bool) -> Result<Vec<TaskRow>> {
         let mut st = self.conn.prepare(

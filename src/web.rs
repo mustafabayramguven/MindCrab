@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Path;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rust_embed::RustEmbed;
@@ -54,7 +54,15 @@ fn mime_for(path: &str) -> &'static str {
     }
 }
 
-fn asset(path: &str) -> Response {
+fn not_modified(req: &HeaderMap, tag: &HeaderValue) -> bool {
+    req.get(header::IF_NONE_MATCH).is_some_and(|v| {
+        v.as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii() == tag.as_bytes())
+    })
+}
+
+fn asset(path: &str, req: &HeaderMap) -> Response {
     // Prefer a pre-compressed copy (served as gzip, which every browser accepts).
     let (file, gz) = match Assets::get(&format!("{path}.gz")) {
         Some(f) => (f, true),
@@ -63,8 +71,26 @@ fn asset(path: &str) -> Response {
             None => return StatusCode::NOT_FOUND.into_response(),
         },
     };
-    let mut r = Response::new(Body::from(file.data.into_owned()));
+    let tag = HeaderValue::from_str(&format!(
+        "\"{}\"",
+        hex::encode(&file.metadata.sha256_hash()[..12])
+    ))
+    .expect("hex etag");
+    let long = path.starts_with("fonts/") || path.starts_with("vendor/");
+    let cache = HeaderValue::from_static(if long {
+        "public, max-age=604800"
+    } else {
+        "no-cache"
+    });
+    if not_modified(req, &tag) {
+        let mut r = StatusCode::NOT_MODIFIED.into_response();
+        r.headers_mut().insert(header::ETAG, tag);
+        r.headers_mut().insert(header::CACHE_CONTROL, cache);
+        return r;
+    }
+    let mut r = Response::new(Body::from(file.data));
     let h = r.headers_mut();
+    h.insert(header::ETAG, tag);
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(mime_for(path)),
@@ -73,23 +99,15 @@ fn asset(path: &str) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    let long = path.starts_with("fonts/") || path.starts_with("vendor/");
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static(if long {
-            "public, max-age=604800"
-        } else {
-            "no-cache"
-        }),
-    );
+    h.insert(header::CACHE_CONTROL, cache);
     if gz {
         h.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
     }
     r
 }
 
-fn index() -> Response {
-    let mut r = asset("index.html");
+fn index(req: &HeaderMap) -> Response {
+    let mut r = asset("index.html", req);
     let h = r.headers_mut();
     h.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -105,12 +123,20 @@ fn index() -> Response {
 
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        .route("/", get(|| async { index() }))
+        .route("/", get(|h: HeaderMap| async move { index(&h) }))
         .route(
             "/sw.js",
-            get(|| async {
+            get(|req: HeaderMap| async move {
+                let tag =
+                    HeaderValue::from_str(&format!("\"sw-{}\"", *ASSET_VERSION)).expect("etag");
+                if not_modified(&req, &tag) {
+                    let mut r = StatusCode::NOT_MODIFIED.into_response();
+                    r.headers_mut().insert(header::ETAG, tag);
+                    return r;
+                }
                 let mut r = Response::new(Body::from(SW_BODY.as_str()));
                 let h = r.headers_mut();
+                h.insert(header::ETAG, tag);
                 h.insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/javascript; charset=utf-8"),
@@ -132,11 +158,11 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         )
         .route(
             "/{*path}",
-            get(|Path(p): Path<String>| async move {
+            get(|Path(p): Path<String>, h: HeaderMap| async move {
                 if p.contains("..") || p == "sw.js" || p == "index.html" {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                asset(&p)
+                asset(&p, &h)
             }),
         )
 }

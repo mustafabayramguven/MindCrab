@@ -408,7 +408,7 @@ mod tests {
     use super::*;
     use crate::index::Index;
 
-    fn resolver() -> (tempfile::TempDir, Resolver) {
+    fn resolver() -> (tempfile::TempDir, std::sync::Arc<Resolver>) {
         let d = tempfile::tempdir().unwrap();
         let mut i = Index::open(&d.path().join("i.db")).unwrap();
         i.upsert("Notes/Target.md", "x", 1, 1, "t").unwrap();

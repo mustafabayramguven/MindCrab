@@ -274,6 +274,11 @@ fn worker(app: Arc<App>, rx: Receiver<()>) {
         Ok(false) => {}
         Err(e) => tracing::warn!("embedding setup failed: {e:#}"),
     }
+    match app.idx().rechunk_missing() {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("prepared {n} notes for semantic search"),
+        Err(e) => tracing::warn!("chunking failed: {e:#}"),
+    }
     let mut backoff = Duration::from_secs(5);
     loop {
         let pending = match app.idx().pending_chunks(emb.cfg.batch) {
