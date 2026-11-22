@@ -12,21 +12,74 @@ use serde_json::Value;
 
 /// Frontmatter keys that hide a note from AI clients.
 pub fn frontmatter_private(fm: &serde_json::Map<String, Value>) -> bool {
-    let falsy = |k: &str| {
-        matches!(fm.get(k), Some(Value::Bool(false)))
-            || fm
-                .get(k)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.eq_ignore_ascii_case("false"))
+    let word = |k: &str| match fm.get(k) {
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        Some(Value::String(s)) => Some(scalar_word(s)),
+        _ => None,
     };
-    let truthy = |k: &str| {
-        matches!(fm.get(k), Some(Value::Bool(true)))
-            || fm
-                .get(k)
-                .and_then(Value::as_str)
-                .is_some_and(|s| s.eq_ignore_ascii_case("true"))
-    };
+    let falsy = |k: &str| word(k).is_some_and(|w| is_falsy(&w));
+    let truthy = |k: &str| word(k).is_some_and(|w| is_truthy(&w));
     falsy("ai") || falsy("mcp") || truthy("private")
+}
+
+/// True when a note's text hides it from AI clients through its frontmatter.
+/// Also catches the flag in a frontmatter block that is not valid YAML, so a
+/// typo elsewhere in the block never exposes the note.
+pub fn content_private(content: &str) -> bool {
+    let Some(yaml) = crate::note::split_frontmatter(content).0 else {
+        return false;
+    };
+    let fm = crate::note::parse_frontmatter(yaml);
+    if !fm.is_empty() {
+        return frontmatter_private(&fm);
+    }
+    // Unparsable block: look for the flag line by line.
+    yaml.lines().any(|line| {
+        if line.starts_with([' ', '\t']) {
+            return false; // nested key
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            return false;
+        };
+        let w = scalar_word(value);
+        match key.trim().trim_matches(['"', '\'']) {
+            "ai" | "mcp" => is_falsy(&w),
+            "private" => is_truthy(&w),
+            _ => false,
+        }
+    })
+}
+
+fn is_falsy(w: &str) -> bool {
+    matches!(w, "false" | "no" | "off")
+}
+
+fn is_truthy(w: &str) -> bool {
+    matches!(w, "true" | "yes" | "on")
+}
+
+/// Lower-cased plain value of a YAML scalar. Strings written back by an editor
+/// may still carry their quotes or an inline comment (`"false # gizli"`,
+/// `"'false'"`); those are removed so the flag keeps its meaning.
+fn scalar_word(s: &str) -> String {
+    let s = s.trim();
+    let s = match s.chars().next() {
+        Some(q @ ('"' | '\'')) => s[1..].split(q).next().unwrap_or(""),
+        _ => {
+            // `#` starts a comment at the start or after whitespace (not in `a#b`).
+            let mut end = s.len();
+            let mut after_space = true;
+            for (i, c) in s.char_indices() {
+                if c == '#' && after_space {
+                    end = i;
+                    break;
+                }
+                after_space = c.is_whitespace();
+            }
+            &s[..end]
+        }
+    };
+    s.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Default, Clone)]
@@ -155,6 +208,59 @@ mod tests {
         assert!(frontmatter_private(&fm("mcp: \"false\"")));
         assert!(frontmatter_private(&fm("private: true")));
         assert!(!frontmatter_private(&fm("ai: true\ntags: [x]")));
+    }
+
+    #[test]
+    fn frontmatter_flags_survive_comments_and_quotes() {
+        let fm = |y: &str| crate::note::parse_frontmatter(y);
+        for y in [
+            "ai: false # gizli",
+            "ai: \"false # gizli\"",
+            "ai: 'false # gizli'",
+            "ai: \"false\"",
+            "ai: 'false'",
+            "ai: \"'false' # x\"",
+            "ai: \"\\\"false\\\" # x\"",
+            "ai: FALSE",
+            "ai: no",
+            "ai: \"No\"",
+            "ai: off",
+            "ai: \"off # yok\"",
+            "mcp: no",
+            "private: yes",
+            "private: \"true # gizli\"",
+            "private: on",
+            "tags: [a]\nai: \"  false  \"",
+        ] {
+            assert!(frontmatter_private(&fm(y)), "should be private: {y}");
+        }
+        for y in [
+            "ai: true",
+            "ai: \"true # false\"",
+            "ai: \"x # false\"",
+            "ai: \"falsey\"",
+            "ai: \"a#false\"",
+            "ai: \"# false\"",
+            "ai: yes",
+            "private: false",
+            "private: \"no # true\"",
+            "title: \"ai: false\"",
+        ] {
+            assert!(!frontmatter_private(&fm(y)), "should be visible: {y}");
+        }
+    }
+
+    #[test]
+    fn content_flags() {
+        assert!(content_private("---\nai: false # gizli\n---\nsır"));
+        assert!(content_private("---\nai: \"false # gizli\"\n---\nsır"));
+        // Broken YAML elsewhere in the block must not expose the note.
+        assert!(content_private("---\nai: false\ntags: [açık\n---\nsır"));
+        assert!(content_private("---\ntags: [x\nprivate: \"yes\"\n---\n"));
+        assert!(!content_private("---\nai: true\n---\nx"));
+        assert!(!content_private("---\nmeta:\n  ai: false\n---\nx"));
+        assert!(!content_private("ai: false\n\nno frontmatter here"));
+        assert!(!content_private(""));
     }
 
     #[test]

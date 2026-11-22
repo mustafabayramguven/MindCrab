@@ -9,8 +9,10 @@ use crate::app::{AResult, App, AppError};
 use crate::features::{AiView, TaskFilter};
 use crate::index::{SNIP_END, SNIP_START};
 use crate::scope::Scope;
+use crate::vault::Vault;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 pub const SUPPORTED_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -57,19 +59,47 @@ fn rpc_error(id: &Value, code: i64, msg: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
 }
 
+/// Most messages accepted in one JSON-RPC batch.
+pub const MAX_BATCH: usize = 32;
+
 /// Handles one JSON-RPC message (or batch). Returns `None` for notifications.
 pub fn handle(app: &App, session: &mut Session, msg: Value) -> Option<Value> {
-    if let Value::Array(items) = msg {
-        let out: Vec<Value> = items
-            .into_iter()
-            .filter_map(|m| handle(app, session, m))
-            .collect();
-        return if out.is_empty() {
-            None
-        } else {
-            Some(Value::Array(out))
-        };
+    let Value::Array(items) = msg else {
+        return handle_one(app, session, msg);
+    };
+    if items.is_empty() {
+        return Some(rpc_error(
+            &Value::Null,
+            -32600,
+            "invalid request: empty batch",
+        ));
     }
+    if items.len() > MAX_BATCH {
+        return Some(rpc_error(
+            &Value::Null,
+            -32600,
+            &format!("invalid request: batch too large (at most {MAX_BATCH} messages)"),
+        ));
+    }
+    let out: Vec<Value> = items
+        .into_iter()
+        .filter_map(|m| match m {
+            Value::Array(_) => Some(rpc_error(
+                &Value::Null,
+                -32600,
+                "invalid request: nested batch",
+            )),
+            m => handle_one(app, session, m),
+        })
+        .collect();
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Array(out))
+    }
+}
+
+fn handle_one(app: &App, session: &mut Session, msg: Value) -> Option<Value> {
     let id = msg.get("id").cloned();
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(json!({}));
@@ -167,7 +197,19 @@ fn tool(
     })
 }
 
-pub fn tool_defs(read_only: bool) -> Vec<Value> {
+static TOOLS_READ_WRITE: LazyLock<Vec<Value>> = LazyLock::new(|| build_tool_defs(false));
+static TOOLS_READ_ONLY: LazyLock<Vec<Value>> = LazyLock::new(|| build_tool_defs(true));
+
+/// Tool definitions, built once per kind of connection.
+pub fn tool_defs(read_only: bool) -> &'static [Value] {
+    if read_only {
+        &TOOLS_READ_ONLY
+    } else {
+        &TOOLS_READ_WRITE
+    }
+}
+
+fn build_tool_defs(read_only: bool) -> Vec<Value> {
     let path = json!({"type": "string", "description": "Note path relative to the vault, e.g. 'Projects/MindCrab.md' (.md optional). A note name or title also works."});
     let hash = json!({"type": "string", "description": "Optional. The hash from read_note; the write fails if the note changed since. Use 'new' to require that the note does not exist yet."});
     let date = json!({"type": "string", "description": "YYYY-MM-DD"});
@@ -397,17 +439,34 @@ fn readable(app: &App, v: &AiView, name: &str) -> AResult<String> {
     }
 }
 
+fn bad_path(e: anyhow::Error) -> AppError {
+    AppError::BadRequest(e.to_string())
+}
+
 /// Checks that the AI may create/change `path` (which may not exist yet).
 fn writable(app: &App, v: &AiView, path: &str) -> AResult<String> {
     let p = match app.find_note(path) {
         Ok(p) => p,
-        Err(_) => crate::vault::Vault::clean_note(path)
-            .map_err(|e| AppError::BadRequest(e.to_string()))?,
+        Err(_) => Vault::clean_note(path).map_err(bad_path)?,
     };
-    if !v.can_read(&p) && app.vault.exists(&p) {
-        return Err(hidden(path));
+    check_writable(app, v, &p, path)?;
+    Ok(p)
+}
+
+/// Like [`writable`] for a path that is used as given, without a lookup by
+/// name — normalised exactly as the write itself will do it (`Vault::clean_note`).
+fn writable_exact(app: &App, v: &AiView, path: &str) -> AResult<String> {
+    let p = Vault::clean_note(path).map_err(bad_path)?;
+    check_writable(app, v, &p, path)?;
+    Ok(p)
+}
+
+/// `p` is a clean note path; `asked` is what the AI passed.
+fn check_writable(app: &App, v: &AiView, p: &str, asked: &str) -> AResult<()> {
+    if !v.can_read(p) && app.vault.exists(p) {
+        return Err(hidden(asked));
     }
-    if !v.can_write(&p) {
+    if !v.can_write(p) {
         return Err(AppError::BadRequest(format!(
             "this connection may not change '{p}' (read-only or outside its folders: {})",
             if v.scope.folders.is_empty() {
@@ -417,7 +476,19 @@ fn writable(app: &App, v: &AiView, path: &str) -> AResult<String> {
             }
         )));
     }
-    Ok(p)
+    Ok(())
+}
+
+/// A revision the AI may see: its note is visible to this connection and
+/// neither it nor a later version of the note is private (this also covers
+/// private notes that were deleted). Anything else looks missing.
+fn visible_revision(app: &App, v: &AiView, id: i64) -> AResult<(String, String)> {
+    let missing = || AppError::NotFound(format!("revision {id} not found"));
+    let (p, content) = app.idx().ai_revision(id)?.ok_or_else(missing)?;
+    if !v.can_read(&p) {
+        return Err(missing());
+    }
+    Ok((p, content))
 }
 
 fn task_line(t: &crate::store::TaskRow) -> String {
@@ -613,13 +684,22 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 .and_then(Value::as_u64)
                 .unwrap_or(100)
                 .clamp(1, 500) as usize;
-            let notes: Vec<_> = app
-                .idx()
-                .list(s(a, "folder"), recent, 1_000_000)?
-                .into_iter()
-                .filter(|m| v.can_read(&m.path))
-                .take(limit)
-                .collect();
+            // Fetch a little more than asked (hidden notes are skipped) and grow
+            // the window only while hidden notes keep it from filling up.
+            let mut fetch = limit + 32;
+            let notes: Vec<_> = loop {
+                let rows = app.idx().list(s(a, "folder"), recent, fetch)?;
+                let complete = rows.len() < fetch;
+                let visible: Vec<_> = rows
+                    .into_iter()
+                    .filter(|m| v.can_read(&m.path))
+                    .take(limit)
+                    .collect();
+                if complete || visible.len() >= limit {
+                    break visible;
+                }
+                fetch = fetch.saturating_mul(4);
+            };
             if notes.is_empty() {
                 return Ok("No notes found.".into());
             }
@@ -797,24 +877,18 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
         }
         "note_history" => {
             if let Some(id) = a.get("revision_id").and_then(Value::as_i64) {
-                let (p, content) = app
-                    .idx()
-                    .revision(id)?
-                    .ok_or_else(|| AppError::NotFound(format!("revision {id} not found")))?;
-                if !v.can_read(&p) {
-                    return Err(AppError::NotFound(format!("revision {id} not found")));
-                }
+                let (p, content) = visible_revision(app, &v, id)?;
                 let _ = write!(out, "revision {id} of {p}\n-----\n{content}");
             } else {
                 let raw = req(a, "path")?;
-                let path = app.find_note(raw).or_else(|_| {
-                    crate::vault::Vault::clean_note(raw)
-                        .map_err(|e| AppError::BadRequest(e.to_string()))
-                })?;
+                let path = app
+                    .find_note(raw)
+                    .or_else(|_| Vault::clean_note(raw).map_err(bad_path))?;
                 if !v.can_read(&path) {
                     return Err(hidden(raw));
                 }
-                let revs = app.idx().revisions(&path)?;
+                // Private versions (and what came before them) are left out.
+                let revs = app.idx().ai_revisions(&path, 50)?;
                 if revs.is_empty() {
                     return Ok(format!("No earlier versions of {path}."));
                 }
@@ -822,7 +896,7 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                     out,
                     "Earlier versions of {path} (newest first). Each is the content *before* the change by 'replaced by':"
                 );
-                for r in revs.iter().take(50) {
+                for r in &revs {
                     let _ = writeln!(
                         out,
                         "- revision_id {} — {} — replaced by {} — {} bytes",
@@ -918,12 +992,9 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 })
                 .unwrap_or_default();
             let topic = s(a, "topic");
-            let probe = format!(
-                "{}/{}.md",
-                app.settings.memory_dir,
-                topic.unwrap_or("Inbox")
-            );
-            writable(app, &v, &probe)?;
+            // Check the note `remember` will really write to (its topic clean-up
+            // turns `/` into `-` and drops leading dots).
+            writable_exact(app, &v, &app.memory_topic_path(topic))?;
             let o =
                 app.remember_or_queue(req(a, "fact")?, topic, &tags, &src, session.scope.review)?;
             if o.queued {
@@ -1017,22 +1088,34 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
         }
         "move_note" => {
             let from_raw = req(a, "from")?;
-            let to = req(a, "to")?;
-            let folder = crate::vault::Vault::clean(from_raw)
+            let to_raw = req(a, "to")?;
+            let folder = Vault::clean(from_raw)
                 .ok()
                 .filter(|f| app.vault.abs(f).is_dir());
             if let Some(f) = folder {
+                if !v.can_read(&format!("{f}/x.md")) {
+                    return Err(hidden(from_raw));
+                }
+                // Check the destination as rename_folder will normalise it.
+                let to = Vault::clean(to_raw).map_err(bad_path)?;
+                let prefix = format!("{f}/");
                 let inside: Vec<_> = app.idx().list(Some(&f), false, 1_000_000)?;
-                let to_probe = format!("{}/x.md", to.trim_matches('/'));
-                if !v.can_write(&format!("{f}/x.md"))
-                    || !v.can_write(&to_probe)
-                    || inside.iter().any(|m| !v.can_write(&m.path))
+                // Every moved note must be writable where it is and where it lands.
+                let lands_ok = |p: &str| {
+                    p.strip_prefix(&prefix)
+                        .is_none_or(|rest| v.can_write(&format!("{to}/{rest}")))
+                };
+                if !v.can_write(&format!("{prefix}x.md"))
+                    || !v.can_write(&format!("{to}/x.md"))
+                    || inside
+                        .iter()
+                        .any(|m| !v.can_write(&m.path) || !lands_ok(&m.path))
                 {
                     return Err(AppError::BadRequest(
                         "this connection may not move that folder".into(),
                     ));
                 }
-                let (to, moved, n) = app.rename_folder(&f, to, &src)?;
+                let (to, moved, n) = app.rename_folder(&f, &to, &src)?;
                 let _ = write!(
                     out,
                     "Moved folder {f} → {to} ({moved} files); updated links in {n} note(s)."
@@ -1042,8 +1125,10 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 if !app.vault.exists(&from) {
                     return Err(hidden(from_raw));
                 }
-                writable(app, &v, to)?;
-                let (to, n) = app.rename_note(&from, to, &src)?;
+                // rename_note uses the destination as given (no lookup by name),
+                // so check exactly that path.
+                let to = writable_exact(app, &v, to_raw)?;
+                let (to, n) = app.rename_note(&from, &to, &src)?;
                 let _ = write!(out, "Moved {from} → {to}; updated links in {n} note(s).");
             }
         }
@@ -1063,11 +1148,9 @@ pub fn call_tool(app: &App, session: &Session, name: &str, a: &Value) -> Result<
                 .get("revision_id")
                 .and_then(Value::as_i64)
                 .ok_or_else(|| AppError::BadRequest("missing argument: revision_id".into()))?;
-            let (p, _) = app
-                .idx()
-                .revision(id)?
-                .ok_or_else(|| AppError::NotFound(format!("revision {id} not found")))?;
-            writable(app, &v, &p)?;
+            let (p, _) = visible_revision(app, &v, id)?;
+            // The revision is written back to its own path; no lookup by name.
+            writable_exact(app, &v, &p)?;
             let r = app.restore_revision(id, &src)?;
             let _ = write!(
                 out,
@@ -1320,6 +1403,208 @@ mod tests {
         assert!(t.contains("| Kitap/1984.md | 1984 | Orwell |"), "{t}");
         let (t, _) = call(&app, &mut s, "memory_review", json!({}));
         assert!(t.contains("facts in the memory folder"), "{t}");
+    }
+
+    #[test]
+    fn move_note_stays_in_scope() {
+        let (_d, app, _) = setup(false);
+        app.write_note("Projeler/A.md", "a", None, "web").unwrap();
+        app.write_note("Projeler/Hedef.md", "h", None, "web")
+            .unwrap();
+        let scope = Scope {
+            name: "g".into(),
+            read_only: false,
+            review: false,
+            folders: vec!["Projeler".into()],
+        };
+        let mut s = Session::new(scope, true);
+        // "Hedef" resolves to Projeler/Hedef.md by name, but the move itself
+        // would use Hedef.md at the vault root.
+        for to in ["Hedef", "Kök.md", "Başka\\A.md", " /Başka/A "] {
+            let (t, e) = call(
+                &app,
+                &mut s,
+                "move_note",
+                json!({"from":"Projeler/A.md","to":to}),
+            );
+            assert!(e && t.contains("may not change"), "{to}: {t}");
+        }
+        assert!(app.vault.exists("Projeler/A.md"));
+        assert!(!app.vault.exists("Hedef.md") && !app.vault.exists("Başka/A.md"));
+        let (t, e) = call(
+            &app,
+            &mut s,
+            "move_note",
+            json!({"from":"A","to":"Projeler\\Alt\\B"}),
+        );
+        assert!(!e, "{t}");
+        assert!(app.vault.exists("Projeler/Alt/B.md"));
+    }
+
+    #[test]
+    fn folder_move_checks_normalised_target() {
+        let (_d, app, mut s) = setup(false);
+        app.write_note("Taşı/n.md", "x", None, "web").unwrap();
+        app.write_note("Gizli/var.md", "y", None, "web").unwrap();
+        app.set_ai_ignore("Gizli/\n").unwrap();
+        for to in ["Gizli\\alt", "Gizli/alt", "/Gizli/alt/", " gizli\\alt "] {
+            let (t, e) = call(&app, &mut s, "move_note", json!({"from":"Taşı","to":to}));
+            assert!(e && t.contains("may not move"), "{to}: {t}");
+        }
+        assert!(app.vault.exists("Taşı/n.md"));
+        assert!(!app.vault.abs("Gizli/alt").exists());
+        // A hidden folder looks missing as a source.
+        let (t, e) = call(
+            &app,
+            &mut s,
+            "move_note",
+            json!({"from":"Gizli","to":"Açık"}),
+        );
+        assert!(e && t.contains("no note matches"), "{t}");
+        assert!(app.vault.exists("Gizli/var.md"));
+        let (t, e) = call(
+            &app,
+            &mut s,
+            "move_note",
+            json!({"from":"Taşı","to":"Yeni\\Yer"}),
+        );
+        assert!(!e, "{t}");
+        assert!(app.vault.exists("Yeni/Yer/n.md"));
+    }
+
+    #[test]
+    fn private_history_stays_hidden() {
+        let (_d, app, mut s) = setup(false);
+        // Made private, then deleted.
+        app.write_note("Sır.md", "ilk sürüm: hassas", None, "t")
+            .unwrap();
+        app.write_note("Sır.md", "---\nai: false\n---\nhassas", None, "t")
+            .unwrap();
+        app.delete_note("Sır.md", "web").unwrap();
+        // Private once (flag with an inline comment), public again now.
+        app.write_note(
+            "Dönen.md",
+            "---\nai: \"false # gizli\"\n---\neski sır",
+            None,
+            "t",
+        )
+        .unwrap();
+        app.write_note("Dönen.md", "artık açık", None, "t").unwrap();
+        // Deleted, in a folder that is ignored now.
+        app.write_note("Özel/n.md", "özel", None, "t").unwrap();
+        app.delete_note("Özel/n.md", "web").unwrap();
+        app.set_ai_ignore("Özel/\n").unwrap();
+
+        let ids: Vec<i64> = ["Sır.md", "Dönen.md", "Özel/n.md"]
+            .iter()
+            .flat_map(|p| app.idx().revisions(p).unwrap())
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids.len(), 4);
+        for id in &ids {
+            for tool in ["note_history", "restore_revision"] {
+                let (t, e) = call(&app, &mut s, tool, json!({"revision_id": id}));
+                assert!(e && t.contains("not found"), "{tool} {id}: {t}");
+            }
+        }
+        assert!(!app.vault.exists("Sır.md") && !app.vault.exists("Özel/n.md"));
+        assert_eq!(app.read_note("Dönen.md").unwrap().content, "artık açık");
+        for p in ["Sır.md", "Sır", "Dönen.md"] {
+            let (t, e) = call(&app, &mut s, "note_history", json!({"path": p}));
+            assert!(!e && t.contains("No earlier versions"), "{p}: {t}");
+        }
+        let (t, e) = call(&app, &mut s, "note_history", json!({"path":"Özel/n.md"}));
+        assert!(e && t.contains("no note matches"), "{t}");
+
+        // An ordinary deleted note can still be found and brought back.
+        app.write_note("Silinen.md", "geri gelecek", None, "t")
+            .unwrap();
+        let (t, e) = call(&app, &mut s, "delete_note", json!({"path":"Silinen.md"}));
+        assert!(!e, "{t}");
+        let (t, e) = call(&app, &mut s, "note_history", json!({"path":"Silinen.md"}));
+        assert!(!e && t.contains("revision_id"), "{t}");
+        let id = app.idx().revisions("Silinen.md").unwrap()[0].id;
+        let (t, e) = call(&app, &mut s, "note_history", json!({"revision_id": id}));
+        assert!(!e && t.contains("geri gelecek"), "{t}");
+        let (t, e) = call(&app, &mut s, "restore_revision", json!({"revision_id": id}));
+        assert!(!e, "{t}");
+        assert_eq!(app.read_note("Silinen.md").unwrap().content, "geri gelecek");
+    }
+
+    #[test]
+    fn remember_checks_the_real_topic_note() {
+        let (_d, app, mut s) = setup(false);
+        app.set_ai_ignore("Memory/Gizli-*\n").unwrap();
+        // `/` becomes `-`, so this would land in the ignored Memory/Gizli-Konu.md.
+        let (t, e) = call(
+            &app,
+            &mut s,
+            "remember",
+            json!({"fact":"x","topic":"Gizli/Konu"}),
+        );
+        assert!(e && t.contains("may not change"), "{t}");
+        assert!(!app.vault.exists("Memory/Gizli-Konu.md"));
+        let (t, e) = call(
+            &app,
+            &mut s,
+            "remember",
+            json!({"fact":"y","topic":"..Açık"}),
+        );
+        assert!(!e && t.contains("Memory/Açık.md"), "{t}");
+        let (t, e) = call(&app, &mut s, "remember", json!({"fact":"z","topic":"   "}));
+        assert!(!e && t.contains("Memory/Inbox.md"), "{t}");
+    }
+
+    #[test]
+    fn batch_limits() {
+        let (_d, app, mut s) = setup(false);
+        let ping = |id: usize| json!({"jsonrpc":"2.0","id":id,"method":"ping"});
+        let r = handle(
+            &app,
+            &mut s,
+            Value::Array((0..MAX_BATCH).map(ping).collect()),
+        )
+        .unwrap();
+        assert_eq!(r.as_array().unwrap().len(), MAX_BATCH);
+        let r = handle(
+            &app,
+            &mut s,
+            Value::Array((0..=MAX_BATCH).map(ping).collect()),
+        )
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32600);
+        assert!(r["id"].is_null());
+        let r = handle(&app, &mut s, json!([])).unwrap();
+        assert_eq!(r["error"]["code"], -32600);
+        let r = handle(&app, &mut s, json!([[ping(1)], ping(2)])).unwrap();
+        assert_eq!(r[0]["error"]["code"], -32600);
+        assert_eq!(r[1]["id"], 2);
+        assert!(
+            handle(
+                &app,
+                &mut s,
+                json!([{"jsonrpc":"2.0","method":"notifications/initialized"}])
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn list_notes_pages_past_hidden_notes() {
+        let (_d, app, mut s) = setup(false);
+        for i in 0..80 {
+            app.write_note(&format!("A/{i:02}.md"), "gizli", None, "t")
+                .unwrap();
+        }
+        app.write_note("B/x.md", "x", None, "t").unwrap();
+        app.write_note("B/y.md", "y", None, "t").unwrap();
+        app.set_ai_ignore("A/\n").unwrap();
+        let (t, e) = call(&app, &mut s, "list_notes", json!({"limit": 2}));
+        assert!(!e, "{t}");
+        assert_eq!(t.lines().count(), 2, "{t}");
+        assert!(!t.contains("A/"), "{t}");
+        let (t, _) = call(&app, &mut s, "list_notes", json!({"folder":"B","limit": 5}));
+        assert!(t.contains("B/x.md") && t.contains("B/y.md"), "{t}");
     }
 
     #[test]

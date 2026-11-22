@@ -296,6 +296,7 @@ impl Index {
         if empty == 0 && me.needs_reindex {
             me.mark_reindexed()?; // fresh database: nothing to migrate
         }
+        me.ensure_store_indexes()?;
         Ok(me)
     }
 
