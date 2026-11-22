@@ -14,8 +14,8 @@ The user can edit it at any time; their edits win.
 
 ## How to use this vault (for AI assistants)
 
-- **Search before you write.** Use `search_notes` / `recall` so you update an
-  existing note instead of creating a duplicate.
+- **Search before you write.** Use `search_notes` (or `list_notes` for a folder)
+  so you update an existing note instead of creating a duplicate.
 - **Small facts → `remember`.** They land in `{memory_dir}/<Topic>.md` as dated
   bullets. Pick an existing topic when one fits.
 - **Bigger things → a note.** One subject per note, a clear title, `[[wikilinks]]`
@@ -79,3 +79,25 @@ pub const TEMPLATE_DAILY: &str =
     "---\ntags: [journal]\n---\n# {{title}}\n\n## Plan\n\n- [ ] \n\n## Log\n\n";
 
 pub const TEMPLATE_MEETING: &str = "---\ntags: [meeting]\ndate: {{date}}\n---\n# {{title}}\n\n**When:** {{date:dddd, D MMMM YYYY}} {{time}}\n**With:** \n\n## Notes\n\n## Decisions\n\n## Action items\n\n- [ ] \n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn templates_have_no_ghost_tasks() {
+        // The empty `- [ ] ` placeholders are for typing into, not tasks.
+        for t in [TEMPLATE_DAILY, TEMPLATE_MEETING] {
+            assert!(t.contains("- [ ] \n"));
+            assert!(crate::tasks::parse(t).is_empty(), "{t}");
+        }
+    }
+
+    #[test]
+    fn memory_guide_names_existing_tools() {
+        // `recall` is not an MCP tool; search_notes is.
+        let m = memory_md("Memory", "Journal");
+        assert!(!m.contains("`recall`"));
+        assert!(m.contains("`search_notes`"));
+    }
+}
