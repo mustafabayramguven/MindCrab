@@ -11,6 +11,19 @@ export function createViews(h) {
   const linkText = (s) => s.replace(/\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|([^\]]+))?\]\]/g, (_, a, b) => b || a);
   const dailyDir = () => S.settings?.daily_dir || "Journal";
 
+  // Full-page renders race each other and the user navigating away: each render
+  // gets a token, and only the latest one for the page still on screen may draw.
+  let pageSeq = 0;
+  const onPage = (name) => S.view === "page" && S.page === name;
+  function beginPage(name, title) {
+    const p = page();
+    p.onclick = p.onchange = null; // the previous page's handlers must not act meanwhile
+    if (!onPage(name)) p.innerHTML = ""; // another page's content must not linger under this title
+    h.showPage(name, title);
+    const seq = ++pageSeq;
+    return () => seq === pageSeq && onPage(name);
+  }
+
   // ---------------------------------------------------------------- tasks
   async function refreshTaskBadge() {
     try {
@@ -36,10 +49,11 @@ export function createViews(h) {
   }
 
   async function showTasks() {
-    h.showPage("tasks", t("tasks.title"));
+    const live = beginPage("tasks", t("tasks.title"));
     const showDone = store.get("tasksDone", false);
     let tasks;
-    try { ({ tasks } = await api("GET", "/api/tasks" + (showDone ? "?done=1" : ""))); } catch (e) { return fail(e); }
+    try { ({ tasks } = await api("GET", "/api/tasks" + (showDone ? "?done=1" : ""))); } catch (e) { if (live()) fail(e); return; }
+    if (!live()) return;
     const today = todayIso(), week = iso(addDays(new Date(), 7));
     const open = tasks.filter((x) => !x.done);
     const groups = [
@@ -65,7 +79,8 @@ export function createViews(h) {
       e.preventDefault();
       try {
         await api("POST", "/api/tasks", { text: $("#task-text").value, due: $("#task-due").value || null });
-        showTasks(); refreshTaskBadge();
+        if (onPage("tasks")) showTasks();
+        refreshTaskBadge();
       } catch (er) { fail(er); }
     };
     page().onchange = async (e) => {
@@ -73,7 +88,8 @@ export function createViews(h) {
       if (!cb) return;
       try { await api("POST", "/api/tasks/toggle", { path: cb.dataset.path, line: +cb.dataset.line, raw: cb.dataset.raw }); }
       catch (er) { fail(er); }
-      setTimeout(() => { showTasks(); refreshTaskBadge(); }, 250);
+      // Refresh only if the user is still here — never pull them back from another view.
+      setTimeout(() => { if (onPage("tasks")) showTasks(); refreshTaskBadge(); }, 250);
     };
   }
 
@@ -91,11 +107,12 @@ export function createViews(h) {
   }
 
   async function showCalendar() {
-    h.showPage("calendar", t("nav.calendar"));
+    const live = beginPage("calendar", t("nav.calendar"));
     const base = S.calMonth || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     S.calMonth = base;
     let tasks = [];
     try { ({ tasks } = await api("GET", "/api/tasks")); } catch {}
+    if (!live()) return;
     const byDay = {};
     for (const x of tasks) { const d = x.due || x.scheduled; if (d) (byDay[d] ||= []).push(x); }
     const notes = new Set(S.notes.map((n) => n.path));
@@ -144,11 +161,14 @@ export function createViews(h) {
 
   // ---------------------------------------------------------------- AI activity
   async function showActivity(append = false) {
-    if (!append) h.showPage("activity", t("act.title"));
+    // "More" appends to the current render, so it must not start a new one.
+    const seq = pageSeq;
+    const live = append ? () => seq === pageSeq && onPage("activity") : beginPage("activity", t("act.title"));
     const all = store.get("actAll", false);
     const before = append ? S.actLast : null;
     let items;
-    try { ({ items } = await api("GET", `/api/activity?limit=40${all ? "&all=1" : ""}${before ? `&before=${before}` : ""}`)); } catch (e) { return fail(e); }
+    try { ({ items } = await api("GET", `/api/activity?limit=40${all ? "&all=1" : ""}${before ? `&before=${before}` : ""}`)); } catch (e) { if (live()) fail(e); return; }
+    if (!live()) return;
     S.actLast = items.length ? items[items.length - 1].id : null;
     const fmtDay = new Intl.DateTimeFormat(LANG, { weekday: "long", day: "numeric", month: "long" });
     let lastDay = append ? S.actDay : null, html = "";
@@ -188,7 +208,7 @@ export function createViews(h) {
             box.hidden = false;
           } catch (er) { fail(er); }
         } else {
-          try { await api("POST", `/api/activity/${id}/undo`); toast(t("act.undone")); await h.loadTree(); showActivity(); } catch (er) { fail(er); }
+          try { await api("POST", `/api/activity/${id}/undo`); toast(t("act.undone")); await h.loadTree(); if (onPage("activity")) showActivity(); } catch (er) { fail(er); }
         }
       };
     } else {
@@ -199,9 +219,10 @@ export function createViews(h) {
 
   // ---------------------------------------------------------------- review & cleanup
   async function showReview() {
-    h.showPage("review", t("rev.title"));
+    const live = beginPage("review", t("rev.title"));
     let facts = [], rev = null;
-    try { [{ facts }, rev] = await Promise.all([api("GET", "/api/pending"), api("GET", "/api/memory-review")]); } catch (e) { return fail(e); }
+    try { [{ facts }, rev] = await Promise.all([api("GET", "/api/pending"), api("GET", "/api/memory-review")]); } catch (e) { if (live()) fail(e); return; }
+    if (!live()) return;
     const factCard = (f) => `<div class="review-card" data-id="${f.id}">
       <textarea rows="2">${esc(f.fact)}</textarea>
       <div class="meta"><span class="badge ai">${esc(f.source.replace(/^mcp:/, ""))}</span><span>${esc(fmtTime(f.ts))}</span>
@@ -231,13 +252,15 @@ export function createViews(h) {
             toast(t("rev.approved"));
           } else { await api("POST", `/api/pending/${id}/reject`); toast(t("rev.rejected")); }
         } catch (er) { fail(er); }
-        h.loadTree(); return showReview();
+        h.loadTree();
+        if (onPage("review")) showReview();
+        return;
       }
       const del = e.target.closest("[data-del]");
       if (del) {
         const d = dups[+del.closest("[data-dup]").dataset.dup][del.dataset.del];
         try { await api("POST", "/api/remove-line", { path: d.path, line: d.line, raw: d.raw }); toast(t("rev.removed")); } catch (er) { fail(er); }
-        showReview();
+        if (onPage("review")) showReview();
       }
     };
   }
@@ -293,11 +316,15 @@ export function createViews(h) {
     $("#conn-folders").value = c?.folders.join(", ") || "";
     $("#conn-readonly").checked = !!c?.read_only;
     $("#conn-review").checked = !!c?.review;
-    $("#conn-token").hidden = true;
+    clearToken();
     $("#conn-ok").hidden = false;
+    let created = false, busy = false;
     $("#conn-form").onsubmit = async (e) => {
-      if (e.submitter?.value !== "ok") return;
+      // Enter is OK now: once the token is shown it just closes, and never saves twice.
+      if (e.submitter?.value !== "ok" || created) return;
       e.preventDefault();
+      if (busy) return;
+      busy = true;
       const body = {
         name: $("#conn-name").value,
         folders: $("#conn-folders").value.split(",").map((x) => x.trim()).filter(Boolean),
@@ -308,9 +335,12 @@ export function createViews(h) {
         if (c) { await api("PUT", `/api/connections/${c.id}`, body); d.close(); }
         else {
           const r = await api("POST", "/api/connections", body);
-          const info = await api("GET", "/api/mcp-info");
-          const url = info.url.replace(/\/mcp$/, "/mcp/" + r.token);
-          $("#conn-token").innerHTML = `<b>${esc(t("conn.tokenOnce"))}</b><code>${esc(r.token)}</code><span>${esc(t("conn.url"))}</span><code>${esc(url)}</code>
+          created = true;
+          const info = await api("GET", "/api/mcp-info").catch(() => null);
+          const url = info ? info.url.replace(/\/mcp$/, () => "/mcp/" + r.token) : "";
+          // The token is shown only once: if the dialog was closed meanwhile, bring it back.
+          if (!d.open) d.showModal();
+          $("#conn-token").innerHTML = `<b>${esc(t("conn.tokenOnce"))}</b><code>${esc(r.token)}</code>${url ? `<span>${esc(t("conn.url"))}</span><code>${esc(url)}</code>` : ""}
             <div class="row-actions"><button class="btn tonal" type="button" id="conn-copy">${I("content_copy")}${esc(t("action.copy"))}</button></div>`;
           $("#conn-token").hidden = false;
           $("#conn-ok").hidden = true;
@@ -318,9 +348,13 @@ export function createViews(h) {
         }
         renderConnections();
       } catch (er) { fail(er); }
+      finally { busy = false; }
     };
     d.showModal();
   }
+  // The one-time token must not outlive the dialog, neither in the DOM nor in the copy handler.
+  function clearToken() { const box = $("#conn-token"); box.innerHTML = ""; box.hidden = true; }
+  $("#conn-dialog").addEventListener("close", clearToken);
   $("#conn-add").addEventListener("click", () => connDialog(null));
 
   // ---------------------------------------------------------------- share target
@@ -342,21 +376,23 @@ export function createViews(h) {
     $("#share-files").innerHTML = files.map((f) => `<span class="pill">${I("attach_file")}${esc(f.name)}</span>`).join("");
     $("#share-target").value = store.get("shareTarget", "daily");
     d.returnValue = "";
-    d.onclose = async () => {
+    const discard = async () => {
       await cache.delete("/__share__");
-      for (let i = 0; i < files.length; i++) await cache.delete(`/__share__/file/${i}`);
-      if (d.returnValue !== "ok") return;
+      for (let i = 0; i < (data.files || []).length; i++) await cache.delete(`/__share__/file/${i}`);
+    };
+    d.onclose = async () => {
+      if (d.returnValue !== "ok") return discard();
       const target = $("#share-target").value;
       store.set("shareTarget", target);
+      let path;
       try {
         let body = $("#share-text").value.trim();
         for (const f of files) {
           const r = await api("POST", "/api/upload?name=" + encodeURIComponent(f.name), f, { raw: true });
           body += `\n\n![[${r.path.split("/").pop()}]]`;
         }
-        const name = $("#share-name").value.trim() || "Paylaşım";
+        const name = $("#share-name").value.trim() || t("share.defaultName");
         const time = new Date().toLocaleTimeString(LANG, { hour: "2-digit", minute: "2-digit" });
-        let path;
         if (target === "new") {
           path = (await api("POST", "/api/note", { path: "Inbox/" + name.replace(/[\\/:*?"<>|#^[\]]/g, "-"), content: `# ${name}\n\n${body}\n` })).path;
         } else {
@@ -364,10 +400,15 @@ export function createViews(h) {
           const text = `### ${time} ${name}\n\n${body}`;
           path = (await api("POST", "/api/append", { path: p, text, heading: target === "daily" ? "Shared" : null })).path;
         }
-        toast(t("share.saved"));
-        await h.loadTree();
-        go(path);
-      } catch (e) { fail(e); }
+      } catch (e) {
+        // Not saved: keep the shared content cached (offline or server error) and offer another try.
+        toast(t("share.saveFailed", { msg: e.message || e }), { label: t("action.retry"), run: () => handleShare() });
+        return;
+      }
+      await discard().catch(() => {}); // stored in the vault now, the cached copy can go
+      toast(t("share.saved"));
+      await h.loadTree().catch(() => {});
+      go(path);
     };
     d.showModal();
   }
