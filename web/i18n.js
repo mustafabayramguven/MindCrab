@@ -215,6 +215,9 @@ const STRINGS = {
     "share.new": "New note",
     "share.saved": "Saved",
     "share.failed": "Sharing needs the app to be opened once with a connection first.",
+    "share.defaultName": "Shared",
+    "share.saveFailed": "Couldn't save the shared item (it is kept): {msg}",
+    "action.retry": "Retry",
     "canvas.text": "Text card",
     "canvas.note": "Note card",
     "canvas.link": "Web link",
@@ -443,6 +446,9 @@ const STRINGS = {
     "share.new": "Yeni not",
     "share.saved": "Kaydedildi",
     "share.failed": "Paylaşım için uygulamanın önce bir kez internetle açılmış olması gerekir.",
+    "share.defaultName": "Paylaşım",
+    "share.saveFailed": "Paylaşılan içerik kaydedilemedi (saklanıyor): {msg}",
+    "action.retry": "Tekrar dene",
     "canvas.text": "Metin kartı",
     "canvas.note": "Not kartı",
     "canvas.link": "Web bağlantısı",
@@ -463,7 +469,8 @@ document.documentElement.lang = LANG;
 
 export function t(key, vars) {
   let s = STRINGS[LANG][key] ?? STRINGS.en[key] ?? key;
-  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, v);
+  // Function replacer: values are inserted literally ("$&", "$$" in a note name stay as typed).
+  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replaceAll(`{${k}}`, () => String(v));
   return s;
 }
 

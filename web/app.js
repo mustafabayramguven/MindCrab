@@ -121,12 +121,27 @@ function hexToHue(hex) {
 }
 
 // ------------------------------------------------------------------ ui helpers
+// The topmost open modal <dialog>. A modal sits in the top layer and makes the
+// rest of the page inert, so transient UI (snackbar, copy helper) must live in it.
+function topModal() {
+  const focused = document.activeElement?.closest?.("dialog[open]");
+  if (focused) return focused;
+  const open = $$("dialog[open]");
+  return open[open.length - 1] || null;
+}
+function placeSnackbar() {
+  const el = $("#snackbar");
+  const host = topModal() || document.body;
+  if (el.parentElement !== host) host.append(el);
+}
 let toastTimer;
 function toast(msg, action) {
   const el = $("#snackbar");
+  placeSnackbar();
   el.innerHTML = `<span>${esc(msg)}</span>`;
   if (action) {
     const b = document.createElement("button");
+    b.type = "button";
     b.className = "btn text";
     b.textContent = action.label;
     b.onclick = () => { el.hidden = true; action.run(); };
@@ -211,19 +226,22 @@ function dialogPrompt({ title, text = "", label = "", value = "", ok = t("action
     }
   });
 }
-$$("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close()));
+$$("dialog [data-close]").forEach((b) => b.addEventListener("click", () => b.closest("dialog").close("cancel")));
 $$("dialog").forEach((d) => d.addEventListener("click", (e) => { if (e.target === d) d.close(); }));
+// A snackbar shown inside a dialog moves back out (or to the next modal) when it closes.
+$$("dialog").forEach((d) => d.addEventListener("close", () => { if ($("#snackbar").parentElement === d) placeSnackbar(); }));
 
+// Formatters are costly to create and fmtTime runs once per list row: build them once.
+const timeFmt = {};
 function fmtTime(ms) {
   if (!ms) return "";
-  const d = new Date(ms);
   const diff = (Date.now() - ms) / 1000;
-  const rtf = new Intl.RelativeTimeFormat(LANG, { numeric: "auto" });
   if (diff < 45) return t("time.justNow");
+  const rtf = (timeFmt.rel ||= new Intl.RelativeTimeFormat(LANG, { numeric: "auto" }));
   if (diff < 3600) return rtf.format(-Math.round(diff / 60), "minute");
   if (diff < 86400) return rtf.format(-Math.round(diff / 3600), "hour");
   if (diff < 86400 * 7) return rtf.format(-Math.round(diff / 86400), "day");
-  return d.toLocaleDateString(LANG, { year: "numeric", month: "short", day: "numeric" });
+  return (timeFmt.date ||= new Intl.DateTimeFormat(LANG, { year: "numeric", month: "short", day: "numeric" })).format(new Date(ms));
 }
 const fmtFull = (ms) => new Date(ms).toLocaleString(LANG, { dateStyle: "medium", timeStyle: "short" });
 const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
@@ -584,7 +602,9 @@ function renderPreview(now = false) {
         : "";
       pv.innerHTML = propsHtml + r.html;
       enhance(pv);
-      pv.querySelectorAll('input[type="checkbox"]').forEach((cb, i) => { cb.disabled = false; cb.dataset.task = i; });
+      // Only the note's own task checkboxes carry data-task (their ordinal in the
+      // source); embedded notes and raw HTML inputs stay read-only.
+      pv.querySelectorAll('input[type="checkbox"][data-task]').forEach((cb) => { cb.disabled = false; });
       if (S.pendingAnchor) { scrollToHeading(S.pendingAnchor); S.pendingAnchor = null; }
     } catch (e) {
       if (e.status === 0 && seq === previewSeq) {
@@ -600,24 +620,44 @@ function scrollToHeading(text) {
   h?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
+// The n-th (0-based) task item of a note's source lines, counted like the
+// renderer numbers data-task: document order, after the frontmatter, outside
+// fenced code blocks, including tasks inside blockquotes.
+const TASK_RE = /^((?:\s*>)*\s*(?:[-*+]|\d{1,9}[.)])\s+\[)([ xX])(\])/;
+const FENCE_RE = /^(?:\s*>)*(?:\s*(?:[-*+]|\d{1,9}[.)])\s+)*\s*(`{3,}|~{3,})(.*)$/;
+function taskLine(lines, n) {
+  let i = 0, count = -1, fence = null;
+  if (/^\uFEFF?---\s*$/.test(lines[0] ?? "")) {
+    const end = lines.findIndex((l, k) => k > 0 && /^(?:---|\.\.\.)\s*$/.test(l));
+    if (end > 0) i = end + 1;
+  }
+  for (; i < lines.length; i++) {
+    const f = lines[i].match(FENCE_RE);
+    if (fence) {
+      // A fence closes with the same character, at least as long, nothing after it.
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+      continue;
+    }
+    if (f && !(f[1][0] === "`" && f[2].includes("`"))) { fence = f[1]; continue; }
+    const m = lines[i].match(TASK_RE);
+    if (m && ++count === n) return { i, m };
+  }
+  return null;
+}
+
 // Toggle task checkboxes in the preview → update source.
 $("#preview").addEventListener("change", (e) => {
   const cb = e.target;
-  if (cb.dataset.task === undefined) return;
+  if (cb.type !== "checkbox" || cb.dataset.task === undefined) return;
   const ed = $("#editor");
-  let n = -1, inFence = false;
   const lines = ed.value.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\s*(```|~~~)/.test(lines[i])) inFence = !inFence;
-    if (inFence) continue;
-    const m = lines[i].match(/^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\])/);
-    if (m && ++n === +cb.dataset.task) {
-      lines[i] = m[1] + (cb.checked ? "x" : " ") + m[3] + lines[i].slice(m[0].length);
-      ed.value = lines.join("\n");
-      onEdit();
-      return;
-    }
-  }
+  const hit = taskLine(lines, +cb.dataset.task);
+  // Source changed since this preview was rendered: redraw rather than toggle a wrong line.
+  if (!hit || (hit.m[2] !== " ") === cb.checked) { renderPreview(true); return; }
+  const { i, m } = hit;
+  lines[i] = m[1] + (cb.checked ? "x" : " ") + m[3] + lines[i].slice(m[0].length);
+  ed.value = lines.join("\n");
+  onEdit();
 });
 $("#preview").addEventListener("click", (e) => {
   const a = e.target.closest("a.wikilink[data-anchor]");
@@ -744,8 +784,16 @@ async function openDaily() {
 async function copy(text) {
   try { await navigator.clipboard.writeText(text); toast(t("action.copied")); }
   catch {
+    // Fallback for insecure contexts. While a modal is open the body is inert,
+    // so the helper textarea has to be selectable inside that dialog.
+    const prev = document.activeElement;
     const ta = document.createElement("textarea");
-    ta.value = text; document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+    ta.value = text;
+    ta.readOnly = true;
+    ta.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+    (topModal() || document.body).append(ta);
+    ta.select(); document.execCommand("copy"); ta.remove();
+    prev?.focus?.({ preventScroll: true });
     toast(t("action.copied"));
   }
 }
@@ -881,22 +929,43 @@ ed.addEventListener("drop", (e) => {
 $("#file-input").addEventListener("change", (e) => { uploadFiles([...e.target.files]); e.target.value = ""; });
 
 // ------------------------------------------------------------------ [[ autocomplete
-const sug = { items: [], active: 0, start: 0 };
-function caretXY() {
-  const div = document.createElement("div");
+const sug = { items: [], active: 0, start: 0, anchor: null };
+// One hidden mirror of the textarea measures caret coordinates. It is filled
+// only for the measurement and emptied again, and the result is kept for the
+// whole [[ … ]] session (the popup stays anchored where the link starts).
+let mirror = null;
+function caretOffset(pos) {
+  if (!mirror) {
+    mirror = document.createElement("div");
+    mirror.setAttribute("aria-hidden", "true");
+    mirror.append(document.createTextNode(""), document.createElement("span"));
+    mirror.lastChild.textContent = "​";
+    document.body.append(mirror);
+  }
   const cs = getComputedStyle(ed);
-  for (const p of ["fontFamily", "fontSize", "lineHeight", "paddingTop", "paddingLeft", "paddingRight", "letterSpacing", "tabSize", "boxSizing"]) div.style[p] = cs[p];
-  Object.assign(div.style, { position: "absolute", visibility: "hidden", whiteSpace: "pre-wrap", overflowWrap: "break-word", width: ed.clientWidth + "px", top: 0, left: 0 });
-  div.textContent = ed.value.slice(0, ed.selectionStart);
-  const span = document.createElement("span");
-  span.textContent = "​";
-  div.append(span);
-  document.body.append(div);
+  for (const p of ["fontFamily", "fontSize", "lineHeight", "paddingTop", "paddingLeft", "paddingRight", "letterSpacing", "tabSize", "boxSizing"]) mirror.style[p] = cs[p];
+  Object.assign(mirror.style, { position: "absolute", visibility: "hidden", pointerEvents: "none", whiteSpace: "pre-wrap", overflowWrap: "break-word", width: ed.clientWidth + "px", top: 0, left: 0 });
+  mirror.firstChild.data = ed.value.slice(0, pos);
+  const span = mirror.lastChild;
+  const off = { left: span.offsetLeft, top: span.offsetTop, lh: parseFloat(cs.lineHeight), pos, width: ed.clientWidth };
+  mirror.firstChild.data = "";
+  return off;
+}
+function caretXY() {
+  const a = sug.anchor;
+  if (!a || a.pos !== sug.start || a.width !== ed.clientWidth) sug.anchor = caretOffset(sug.start);
   const r = ed.getBoundingClientRect();
-  const x = r.left + span.offsetLeft - ed.scrollLeft;
-  const y = r.top + span.offsetTop - ed.scrollTop + parseFloat(cs.lineHeight);
-  div.remove();
-  return { x, y };
+  return { x: r.left + sug.anchor.left - ed.scrollLeft, y: r.top + sug.anchor.top - ed.scrollTop + sug.anchor.lh };
+}
+// Folded name/title/path per note object; S.notes gets new objects when the tree changes.
+const foldCache = new WeakMap();
+function foldedNote(n) {
+  let f = foldCache.get(n);
+  if (!f || f.p !== n.path || f.t !== n.title) {
+    f = { p: n.path, t: n.title, name: fold(stem(n.path)), title: fold(n.title), path: fold(n.path) };
+    foldCache.set(n, f);
+  }
+  return f;
 }
 function updateSuggest() {
   const s = ed.selectionStart;
@@ -907,7 +976,7 @@ function updateSuggest() {
   sug.start = s - m[1].length;
   const scored = [];
   for (const n of S.notes) {
-    const name = fold(stem(n.path)), title = fold(n.title), path = fold(n.path);
+    const { name, title, path } = foldedNote(n);
     let sc = name.startsWith(q) ? 0 : title.startsWith(q) ? 1 : name.includes(q) ? 2 : title.includes(q) || path.includes(q) ? 3 : -1;
     if (sc >= 0) scored.push([sc, n]);
   }
@@ -924,7 +993,7 @@ function updateSuggest() {
   box.style.left = Math.min(x, innerWidth - box.offsetWidth - 8) + "px";
   box.style.top = (y + box.offsetHeight > innerHeight - 8 ? y - box.offsetHeight - 28 : y + 4) + "px";
 }
-function hideSuggest() { $("#suggest").hidden = true; sug.items = []; }
+function hideSuggest() { $("#suggest").hidden = true; sug.items = []; sug.anchor = null; }
 function pickSuggest(i) {
   const n = sug.items[i];
   if (!n) return;
@@ -956,17 +1025,21 @@ $$(".tabs [role=tab]").forEach((b) => b.addEventListener("click", () => {
   loadPanel();
 }));
 
+let panelSeq = 0;
 async function loadPanel() {
   const body = $("#panel-body");
+  // Only the latest call may draw: the note or the tab can change while a request is in flight.
+  const seq = ++panelSeq;
   if (!S.path || S.view !== "note") { body.innerHTML = `<p class="panel-empty">${esc(t("links.none"))}</p>`; return; }
-  const path = S.path;
+  const path = S.path, tab = S.tab;
+  const stale = () => seq !== panelSeq || S.path !== path || S.tab !== tab;
   try {
     if (S.tab === "links") {
       const [r, rel] = await Promise.all([
         api("GET", "/api/links?path=" + encodeURIComponent(path)),
         S.semantic ? api("GET", "/api/related?path=" + encodeURIComponent(path)).catch(() => ({ related: [] })) : { related: [] },
       ]);
-      if (S.path !== path) return;
+      if (stale()) return;
       const item = (p, title, ctx) => `<a class="panel-item" href="#/n/${encPath(p)}"><span class="t">${esc(title)}</span>${ctx ? `<span class="c">${esc(ctx)}</span>` : ""}</a>`;
       const sec = (title, items) => `<div class="panel-section"><h4>${esc(title)}<span>${items.length}</span></h4>${items.join("") || `<p class="panel-empty">${esc(t("links.none"))}</p>`}</div>`;
       body.innerHTML =
@@ -978,7 +1051,7 @@ async function loadPanel() {
         (S.semantic ? sec(t("links.related"), rel.related.map((x) => item(x.path, stem(x.path), x.snippet))) : "");
     } else if (S.tab === "history") {
       const r = await api("GET", "/api/history?path=" + encodeURIComponent(path));
-      if (S.path !== path) return;
+      if (stale()) return;
       body.innerHTML = r.revisions.length
         ? r.revisions.map((v) => `<a class="panel-item" data-rev="${v.id}"><span class="t">${esc(fmtFull(v.created_at))}</span><span class="c">${esc(t("history.replacedBy"))} <span class="badge ${v.source.startsWith("mcp:") ? "ai" : ""}">${esc(v.source)}</span> · ${fmtSize(v.size)}</span></a>`).join("")
         : `<p class="panel-empty">${esc(t("history.none"))}</p>`;
@@ -994,7 +1067,7 @@ async function loadPanel() {
         <div class="panel-section"><h4>${esc(t("info.tags"))}</h4><div class="chips" style="padding:0 4px">${n.tags.map((x) => `<a class="chip" href="#/tag/${encodeURIComponent(x)}">#${esc(x)}</a>`).join("") || `<span class="panel-empty">${esc(t("links.none"))}</span>`}</div></div>
         ${fm.length ? `<div class="panel-section"><h4>${esc(t("info.props"))}</h4><dl class="kv">${fm.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === "object" ? JSON.stringify(v) : v)}</dd>`).join("")}</dl></div>` : ""}`;
     }
-  } catch (e) { fail(e); }
+  } catch (e) { if (!stale()) fail(e); }
 }
 $("#panel-body").addEventListener("click", (e) => {
   const r = e.target.closest("[data-rev]");
@@ -1004,17 +1077,30 @@ $("#panel-body").addEventListener("click", (e) => {
 
 function diffLines(a, b) {
   const A = a.split("\n"), B = b.split("\n");
-  if (A.length * B.length > 4e6) return null;
-  const n = A.length, m = B.length;
-  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) dp[i][j] = A[i] === B[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  // Unchanged head and tail need no LCS table; only the middle does.
+  let lo = 0, ha = A.length, hb = B.length;
+  while (lo < ha && lo < hb && A[lo] === B[lo]) lo++;
+  while (ha > lo && hb > lo && A[ha - 1] === B[hb - 1]) { ha--; hb--; }
   const out = [];
-  let i = 0, j = 0;
-  while (i < n || j < m) {
-    if (i < n && j < m && A[i] === B[j]) { out.push(["same", A[i]]); i++; j++; }
-    else if (j < m && (i >= n || dp[i][j + 1] >= dp[i + 1][j])) { out.push(["add", B[j]]); j++; }
-    else { out.push(["del", A[i]]); i++; }
+  for (let k = 0; k < lo; k++) out.push(["same", A[k]]);
+  const n = ha - lo, m = hb - lo;
+  if (n * m > 4e6) {
+    // Too large for the table: show the changed block as removed, then added.
+    for (let k = lo; k < ha; k++) out.push(["del", A[k]]);
+    for (let k = lo; k < hb; k++) out.push(["add", B[k]]);
+  } else {
+    const w = m + 1, dp = new Uint32Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] = A[lo + i] === B[lo + j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+    let i = 0, j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && A[lo + i] === B[lo + j]) { out.push(["same", A[lo + i]]); i++; j++; }
+      else if (j < m && (i >= n || dp[i * w + j + 1] >= dp[(i + 1) * w + j])) { out.push(["add", B[lo + j]]); j++; }
+      else { out.push(["del", A[lo + i]]); i++; }
+    }
   }
+  for (let k = ha; k < A.length; k++) out.push(["same", A[k]]);
   return out;
 }
 
@@ -1183,8 +1269,12 @@ async function openSettings() {
     views.renderConnections();
     const [info, sess] = await Promise.all([api("GET", "/api/mcp-info"), api("GET", "/api/session")]);
     $("#version").textContent = `MindCrab v${sess.version}`;
-    const mask = (s) => s.slice(0, 6) + "•".repeat(12) + s.slice(-4);
-    const maskedUrl = info.url_with_token.replace(info.token, mask(info.token));
+    if (!$("#settings-dialog").open) return; // closed meanwhile: don't leave the token behind
+    // Reveal at most an eighth of the token at each end (≤ 6 + 4 chars), so short tokens stay hidden too.
+    const mask = (s) => { const k = s.length >> 3; return s.slice(0, Math.min(6, k)) + "•".repeat(12) + s.slice(s.length - Math.min(4, k)); };
+    // Function replacers: a token may contain "$" sequences that a replacement string would expand.
+    const hideToken = (s) => (info.token ? s.replaceAll(info.token, () => mask(info.token)) : s);
+    const maskedUrl = hideToken(info.url_with_token);
     const snippets = {
       "Claude Code": `claude mcp add --transport http mindcrab ${info.url} \\\n  --header "Authorization: Bearer ${info.token}"`,
       "claude.ai / Desktop": `Settings → Connectors → Add custom connector\nURL: ${info.url_with_token}`,
@@ -1205,7 +1295,7 @@ async function openSettings() {
       <div class="snippet"><pre id="snip-pre"></pre><button class="icon-btn" data-copy="snippet">${I("content_copy")}</button></div>
     </div>`;
     let current = Object.keys(snippets)[0];
-    const show = () => ($("#snip-pre").textContent = snippets[current].replaceAll(info.token, mask(info.token)));
+    const show = () => ($("#snip-pre").textContent = hideToken(snippets[current]));
     show();
     box.onclick = (e) => {
       const c = e.target.closest("[data-copy]");
@@ -1215,6 +1305,8 @@ async function openSettings() {
     };
   } catch (e) { fail(e); }
 }
+// Drop the MCP token from the DOM and from the copy handler's closure once settings close.
+$("#settings-dialog").addEventListener("close", () => { const box = $("#mcp-info"); box.innerHTML = ""; box.onclick = null; });
 async function renderSemantic() {
   const el = $("#semantic-info");
   try {
@@ -1401,19 +1493,25 @@ async function enhance(root) {
       await loadScript("/vendor/mermaid.min.js");
       const dark = document.documentElement.classList.contains("dark");
       if (mermaidReady !== dark) {
-        window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: dark ? "dark" : "default", fontFamily: "Roboto Flex, system-ui, sans-serif" });
+        // suppressErrorRendering: a syntax error (common while typing) throws instead of
+        // leaving an error SVG appended to document.body.
+        window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", suppressErrorRendering: true, theme: dark ? "dark" : "default", fontFamily: "Roboto Flex, system-ui, sans-serif" });
         mermaidReady = dark;
       }
       let i = 0;
       for (const code of mm) {
         const pre = code.parentElement;
+        const id = `mm-${Date.now()}-${i++}`;
         try {
-          const { svg } = await window.mermaid.render(`mm-${Date.now()}-${i++}`, code.textContent);
+          const { svg } = await window.mermaid.render(id, code.textContent);
           const div = document.createElement("div");
           div.className = "mermaid";
           div.innerHTML = svg;
           pre.replaceWith(div);
-        } catch (e) { pre.title = String(e?.message || e); }
+        } catch (e) {
+          pre.title = String(e?.message || e);
+          document.getElementById("d" + id)?.remove(); // mermaid's scratch container, if left behind
+        }
       }
     } catch {}
   }
@@ -1424,9 +1522,9 @@ async function enhance(root) {
   }
 }
 
-function fmtCell(v, col, path) {
+function fmtCell(v, col, path, link = true) {
   if (v === null || v === undefined || v === "") return "";
-  if (col === "title" || col === "name") return `<a class="wikilink" href="#/n/${encPath(path)}">${esc(v)}</a>`;
+  if (col === "title" || col === "name") return link ? `<a class="wikilink" href="#/n/${encPath(path)}">${esc(v)}</a>` : esc(v);
   if (Array.isArray(v)) return v.map((x) => `<span class="pill">${esc(typeof x === "object" ? JSON.stringify(x) : x)}</span>`).join(" ");
   if (typeof v === "boolean") return v ? "✓" : "✗";
   if (typeof v === "object") return esc(JSON.stringify(v));
@@ -1449,7 +1547,7 @@ async function renderBase(el, spec) {
     }
     const head = `<div class="base-head">${I("table")}<span>${r.total}</span><span class="sp"></span></div>`;
     if (r.view === "cards") {
-      el.innerHTML = head + `<div class="base-cards">${rows.map((row) => `<a class="base-card" href="#/n/${encPath(row.path)}">${row.values.map((v, i) => i === 0 ? `<b>${esc(v ?? stem(row.path))}</b>` : v === null || v === "" ? "" : `<div><span class="muted">${esc(r.columns[i])}:</span> ${fmtCell(v, r.columns[i], row.path)}</div>`).join("")}</a>`).join("")}</div>`;
+      el.innerHTML = head + `<div class="base-cards">${rows.map((row) => `<a class="base-card" href="#/n/${encPath(row.path)}">${row.values.map((v, i) => i === 0 ? `<b>${esc(v ?? stem(row.path))}</b>` : v === null || v === "" ? "" : `<div><span class="muted">${esc(r.columns[i])}:</span> ${fmtCell(v, r.columns[i], row.path, false)}</div>`).join("")}</a>`).join("")}</div>`;
     } else if (r.view === "list") {
       el.innerHTML = head + `<ul style="margin:8px 0;padding-left:32px">${rows.map((row) => `<li><a class="wikilink" href="#/n/${encPath(row.path)}">${esc(row.values[0] ?? stem(row.path))}</a></li>`).join("")}</ul>`;
     } else {
@@ -1505,63 +1603,156 @@ document.addEventListener("mouseover", (e) => {
 document.addEventListener("click", () => hideHover(), true);
 
 // ------------------------------------------------------------------ properties (frontmatter) editor
+const FM_RE = /^---\r?\n(?:([\s\S]*?)\r?\n)?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
+// One YAML scalar — plain, "double" or 'single' quoted — with an optional
+// trailing "# comment". Returns its string value, or undefined if it is not
+// that simple (the panel then leaves the frontmatter alone).
+function fmScalar(s) {
+  s = s.trim();
+  const q = s[0];
+  if (q === '"' || q === "'") {
+    let i = 1;
+    for (; i < s.length; i++) {
+      if (q === '"' && s[i] === "\\") i++;
+      else if (s[i] === q) { if (q === "'" && s[i + 1] === "'") i++; else break; }
+    }
+    if (i >= s.length) return undefined; // unterminated / multi-line
+    const rest = s.slice(i + 1).trim();
+    if (rest && !rest.startsWith("#")) return undefined;
+    if (q === "'") return s.slice(1, i).replace(/''/g, "'");
+    try { return JSON.parse(s.slice(0, i + 1)); } catch { return s.slice(1, i); }
+  }
+  if (/^[|>{[&*!%@`]/.test(s)) return undefined; // block scalars, flow maps, anchors, aliases, tags
+  // Plain scalar: a comment starts at a "#" that follows whitespace (`ai: false # gizli`).
+  const c = s.search(/(^|\s)#/);
+  return c < 0 ? s : s.slice(0, c).trimEnd();
+}
+// A one-line flow sequence `[a, "b, c", d] # comment` → its items, or undefined.
+function fmFlowList(s) {
+  s = s.trim();
+  const items = [];
+  let cur = "", q = null, i = 1;
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      cur += c;
+      if (q === '"' && c === "\\") cur += s[++i] ?? "";
+      else if (c === q) { if (q === "'" && s[i + 1] === "'") cur += s[++i]; else q = null; }
+      continue;
+    }
+    if (c === "]") break;
+    if (c === "[" || c === "{") return undefined;
+    if (c === ",") { items.push(cur); cur = ""; continue; }
+    if ((c === '"' || c === "'") && !cur.trim()) q = c;
+    cur += c;
+  }
+  if (i >= s.length) return undefined; // no closing bracket on this line
+  const rest = s.slice(i + 1).trim();
+  if (rest && !rest.startsWith("#")) return undefined;
+  items.push(cur);
+  const out = [];
+  for (const it of items) {
+    if (!it.trim()) continue;
+    const v = fmScalar(it);
+    if (v === undefined) return undefined;
+    out.push(v);
+  }
+  return out;
+}
+// Simple frontmatter → entries the panel can edit. Each entry keeps its source
+// (key text, everything after the colon incl. comments, list lines, and the
+// comment/blank lines above it) so untouched properties are written back verbatim.
 function parseFm(text) {
-  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/);
-  if (!m) return { ok: true, entries: [], end: 0 };
-  const lines = m[1].split(/\r?\n/);
+  const m = text.match(FM_RE);
+  if (!m) return { ok: true, entries: [], tail: [], end: 0 };
+  const lines = m[1] === undefined ? [] : m[1].split(/\r?\n/);
   const entries = [];
+  let lead = [];
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    if (!l.trim() || l.trim().startsWith("#")) continue;
-    const kv = l.match(/^([^\s:#][^:]*):\s*(.*)$/);
+    if (!l.trim() || l.trim().startsWith("#")) { lead.push(l); continue; }
+    const kv = l.match(/^([^\s:#][^:]*):(.*)$/);
     if (!kv) return { ok: false };
-    const key = kv[1].trim();
-    let val = kv[2].trim();
-    if (val === "" ) {
+    const src = kv[2].trim(), more = [];
+    let value;
+    if (src === "" || src.startsWith("#")) {
       const items = [];
-      while (i + 1 < lines.length && /^\s*-\s/.test(lines[i + 1])) items.push(lines[++i].replace(/^\s*-\s+/, "").trim().replace(/^["']|["']$/g, ""));
+      while (i + 1 < lines.length && /^\s*-\s/.test(lines[i + 1])) {
+        const item = lines[i + 1].replace(/^\s*-\s+/, "");
+        // Nested lists / mappings inside the list are beyond the panel.
+        if (/^[^"'#]*?:(\s|$)/.test(item)) return { ok: false };
+        const v = fmScalar(item);
+        if (v === undefined) return { ok: false };
+        items.push(v);
+        more.push(lines[++i]);
+      }
       if (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1]) && !items.length) return { ok: false };
-      entries.push([key, items.length ? items : ""]);
-    } else if (val.startsWith("[") && val.endsWith("]")) {
-      entries.push([key, val.slice(1, -1).split(",").map((x) => x.trim().replace(/^["']|["']$/g, "")).filter(Boolean)]);
-    } else if (val === "|" || val === ">" || val.startsWith("{")) {
-      return { ok: false };
-    } else entries.push([key, val.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1")]);
+      value = items.length ? items : "";
+    } else value = src.startsWith("[") ? fmFlowList(src) : fmScalar(src);
+    if (value === undefined) return { ok: false };
+    entries.push({ key: kv[1].trim(), keySrc: kv[1], value, valSrc: kv[2], more, lead });
+    lead = [];
   }
-  return { ok: true, entries, end: m[0].length };
+  return { ok: true, entries, tail: lead, end: m[0].length };
 }
+const fmShow = (v) => (Array.isArray(v) ? v.join(", ") : v);
 function yamlScalar(v) {
-  if (v === "" || /^[\w\-./+ ]*$/u.test(v) && !/^(true|false|null|yes|no|~)$/i.test(v) && !/^\d/.test(v) && !/^\s|\s$/.test(v)) return v;
-  if (/^-?\d+(\.\d+)?$/.test(v) || /^\d{4}-\d{2}-\d{2}/.test(v) || /^(true|false)$/i.test(v)) return v;
+  if (v === "" || /^[\w\-./+ ]*$/u.test(v) && !/^(true|false|null|yes|no|~)$/i.test(v) && !/^\d/.test(v) && !/^\s|\s$/.test(v) && !/^-(\s|$)/.test(v)) return v;
+  // Numbers, dates and booleans stay unquoted so they keep their YAML type (`ai: false` must stay a boolean).
+  if (/^-?\d+(\.\d+)?$/.test(v) || /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/.test(v) || /^(true|false)$/i.test(v)) return v;
   return JSON.stringify(v);
 }
-function writeFm(entries) {
-  const body = ed.value.replace(/^---\r?\n[\s\S]*?\r?\n(?:---|\.\.\.)\s*(?:\r?\n|$)/, "");
-  const live = entries.filter(([k]) => k.trim());
-  if (!live.length) { ed.value = body; onEdit(); return; }
-  const yaml = live.map(([k, v]) => Array.isArray(v) ? `${k.trim()}: [${v.map(yamlScalar).join(", ")}]` : `${k.trim()}: ${yamlScalar(String(v))}`).join("\n");
-  ed.value = `---\n${yaml}\n---\n${body}`;
+// Panel rows ({ key, input, arr, i }) → frontmatter YAML (null when nothing is left).
+// `fm` is the parse the rows were drawn from; row.i points into it (-1 for new rows).
+function serializeFm(rows, fm) {
+  const out = [];
+  let any = false;
+  for (const r of rows) {
+    const k = r.key.trim();
+    if (!k) continue;
+    any = true;
+    const e = fm.entries[r.i];
+    if (e) out.push(...e.lead);
+    if (e && r.input === fmShow(e.value) && (k === e.key || r.arr === Array.isArray(e.value))) {
+      // Value untouched: keep its exact source (quoting, comments, list layout).
+      out.push((k === e.key ? e.keySrc : k) + ":" + e.valSrc, ...e.more);
+    } else {
+      const v = r.arr ? r.input.split(",").map((x) => x.trim()).filter(Boolean) : r.input.trim();
+      out.push(Array.isArray(v) ? `${k}: [${v.map(yamlScalar).join(", ")}]` : `${k}: ${yamlScalar(v)}`);
+    }
+  }
+  return any ? [...out, ...fm.tail].join("\n") : null;
+}
+let propsSnap = null; // { path, fm }: the parse the panel rows were drawn from
+function writeFm(rows) {
+  // Rows drawn for another note, or the frontmatter became too complex meanwhile: don't clobber it.
+  if (!propsSnap || propsSnap.path !== S.path || !parseFm(ed.value).ok) return renderProps();
+  const body = ed.value.replace(FM_RE, "");
+  const yaml = serializeFm(rows, propsSnap.fm);
+  ed.value = yaml === null ? body : `---\n${yaml}\n---\n${body}`;
   onEdit();
 }
 const ARRAY_KEYS = new Set(["tags", "tag", "aliases", "alias", "cssclasses"]);
 function renderProps() {
   const box = $("#props-rows");
   if (!box || S.view !== "note") return;
-  if (document.activeElement && box.contains(document.activeElement)) return; // don't fight the user
+  // Don't fight the user, unless the rows still belong to another note.
+  if (document.activeElement && box.contains(document.activeElement) && propsSnap?.path === S.path) return;
   const fm = parseFm(ed.value);
+  propsSnap = fm.ok ? { path: S.path, fm } : null;
   $("#props-count").textContent = fm.ok ? (fm.entries.length || "") : "";
   if (!fm.ok) { box.innerHTML = `<p class="props-note">${esc(t("props.complex"))}</p>`; return; }
-  box.innerHTML = fm.entries.map(([k, v], i) => `<div class="prop-row" data-i="${i}" data-arr="${Array.isArray(v) ? 1 : 0}">
-      <input class="k" value="${esc(k)}" placeholder="${esc(t("props.key"))}">
-      <input class="v" value="${esc(Array.isArray(v) ? v.join(", ") : v)}" placeholder="${esc(t("props.value"))}">
+  box.innerHTML = fm.entries.map((e, i) => `<div class="prop-row" data-i="${i}" data-arr="${Array.isArray(e.value) ? 1 : 0}">
+      <input class="k" value="${esc(e.key)}" placeholder="${esc(t("props.key"))}">
+      <input class="v" value="${esc(fmShow(e.value))}" placeholder="${esc(t("props.value"))}">
       <button class="icon-btn small" type="button" data-del>${I("close")}</button></div>`).join("")
     + `<div><button class="btn text" type="button" id="prop-add">${I("add")}${esc(t("props.add"))}</button></div>`;
 }
 function collectProps() {
   return $$("#props-rows .prop-row").map((r) => {
-    const k = r.querySelector(".k").value, raw = r.querySelector(".v").value;
-    const arr = r.dataset.arr === "1" || ARRAY_KEYS.has(k.trim().toLowerCase());
-    return [k, arr ? raw.split(",").map((x) => x.trim()).filter(Boolean) : raw.trim()];
+    const key = r.querySelector(".k").value;
+    const arr = r.dataset.arr === "1" || ARRAY_KEYS.has(key.trim().toLowerCase());
+    return { key, input: r.querySelector(".v").value, arr, i: r.dataset.i === "" ? -1 : +r.dataset.i };
   });
 }
 $("#props-rows").addEventListener("change", () => writeFm(collectProps()));
@@ -1571,13 +1762,11 @@ $("#props-rows").addEventListener("click", (e) => {
     writeFm(collectProps());
     renderProps();
   } else if (e.target.closest("#prop-add")) {
-    const entries = collectProps();
-    entries.push(["", ""]);
-    const box = $("#props-rows");
-    box.querySelector("#prop-add").parentElement.insertAdjacentHTML("beforebegin", `<div class="prop-row" data-i="${entries.length - 1}" data-arr="0">
+    const add = $("#props-rows #prop-add").parentElement;
+    add.insertAdjacentHTML("beforebegin", `<div class="prop-row" data-i="" data-arr="0">
       <input class="k" placeholder="${esc(t("props.key"))}"><input class="v" placeholder="${esc(t("props.value"))}">
       <button class="icon-btn small" type="button" data-del>${I("close")}</button></div>`);
-    box.querySelector(".prop-row:last-of-type .k")?.focus();
+    add.previousElementSibling.querySelector(".k").focus();
   }
 });
 let propsTimer;
