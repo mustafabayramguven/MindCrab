@@ -457,12 +457,23 @@ impl Index {
         Ok((true, old.is_none()))
     }
 
-    /// Creates chunks for notes that have none (semantic search was just turned on).
+    /// Creates chunks for notes that have none (semantic search was just turned on). After a
+    /// chunker change, or a run without an embedder (notes may have changed meanwhile), every
+    /// note is re-chunked once instead; chunks whose text is unchanged keep their vectors.
     pub fn rechunk_missing(&mut self) -> Result<usize> {
+        let version: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key='chunker'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let all = version.as_deref() != Some(crate::embed::CHUNKER_VERSION);
         let rows: Vec<(String, String)> = {
-            let mut st = self.conn.prepare(
-                "SELECT path, content FROM notes WHERE path NOT IN (SELECT DISTINCT path FROM chunks)",
-            )?;
+            let mut st = self.conn.prepare(if all {
+                "SELECT path, content FROM notes"
+            } else {
+                "SELECT path, content FROM notes WHERE path NOT IN (SELECT DISTINCT path FROM chunks)"
+            })?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?
         };
@@ -471,17 +482,24 @@ impl Index {
             let p = note::parse(path, content);
             write_chunks(&tx, path, &crate::embed::chunk(&p.title, &p.body))?;
         }
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('chunker',?1) ON CONFLICT(key) DO UPDATE SET value=?1",
+            [crate::embed::CHUNKER_VERSION],
+        )?;
         tx.commit()?;
         self.vec_gen += 1;
         Ok(rows.len())
     }
 
-    /// Without an embedder, unembedded chunks are dead weight.
+    /// Without an embedder, chunks still waiting for a vector are dead weight; embedded ones
+    /// are kept for when semantic search comes back. Chunks aren't kept up to date meanwhile,
+    /// so the next run with an embedder re-chunks every note (see `rechunk_missing`).
     pub fn drop_pending_chunks(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM chunks WHERE path IN (SELECT DISTINCT path FROM chunks WHERE vec IS NULL)",
-            [],
-        )?)
+        self.conn
+            .execute("DELETE FROM meta WHERE key='chunker'", [])?;
+        Ok(self
+            .conn
+            .execute("DELETE FROM chunks WHERE vec IS NULL", [])?)
     }
 
     /// Removes a note from the index, keeping its last content as a revision.
@@ -911,7 +929,8 @@ impl Index {
         Ok(cur.is_some())
     }
 
-    /// Chunks that still need a vector: (path, idx, hash, text).
+    /// Chunks that still need a vector: (path, idx, hash, text). Chunks the API rejected
+    /// hold an empty vector, so they aren't retried until their text changes.
     pub fn pending_chunks(&self, limit: usize) -> Result<Vec<(String, i64, String, String)>> {
         let mut st = self.conn.prepare("SELECT path, idx, hash, text FROM chunks WHERE vec IS NULL ORDER BY path, idx LIMIT ?1")?;
         Ok(st
@@ -922,6 +941,7 @@ impl Index {
     }
 
     /// Stores vectors; rows whose chunk changed meanwhile (hash mismatch) are skipped.
+    /// An empty vector marks a chunk the API rejects: no longer pending, never searched.
     pub fn store_vectors(&mut self, rows: &[(String, i64, String, Vec<f32>)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
@@ -936,7 +956,7 @@ impl Index {
         Ok(())
     }
 
-    /// (chunks with a vector, all chunks)
+    /// (chunks done — embedded, or skipped as rejected —, all chunks)
     pub fn embed_stats(&self) -> Result<(i64, i64)> {
         Ok(self
             .conn
@@ -948,7 +968,7 @@ impl Index {
     pub fn load_vectors(&self) -> Result<Vec<(String, i64, Vec<f32>)>> {
         let mut st = self
             .conn
-            .prepare("SELECT path, idx, vec FROM chunks WHERE vec IS NOT NULL")?;
+            .prepare("SELECT path, idx, vec FROM chunks WHERE length(vec) > 0")?;
         Ok(st
             .query_map([], |r| {
                 let b: Vec<u8> = r.get(2)?;
@@ -1037,26 +1057,35 @@ fn coalesce(tx: &rusqlite::Transaction, path: &str, source: &str) -> Result<bool
     Ok(matches!(last, Some((s, t)) if s == "web" && now_ms() - t < COALESCE_MS))
 }
 
-/// Stores chunks, keeping vectors of chunks whose text didn't change.
+/// Stores chunks, keeping the vectors of chunks whose text didn't change — wherever they
+/// moved, so text inserted near the top doesn't re-embed everything below it.
 fn write_chunks(tx: &rusqlite::Transaction, path: &str, chunks: &[String]) -> Result<()> {
     let mut old_hashes: HashMap<i64, String> = HashMap::new();
+    let mut old_vecs: HashMap<String, Vec<u8>> = HashMap::new();
     {
-        let mut q = tx.prepare_cached("SELECT idx, hash FROM chunks WHERE path=?1")?;
+        let mut q = tx.prepare_cached("SELECT idx, hash, vec FROM chunks WHERE path=?1")?;
         for row in q.query_map([path], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<Vec<u8>>>(2)?,
+            ))
         })? {
-            let (i, h) = row?;
+            let (i, h, v) = row?;
+            if let Some(v) = v {
+                old_vecs.insert(h.clone(), v);
+            }
             old_hashes.insert(i, h);
         }
     }
     let mut put = tx.prepare_cached(
-        "INSERT INTO chunks(path,idx,hash,text,vec) VALUES(?1,?2,?3,?4,NULL)
-         ON CONFLICT(path,idx) DO UPDATE SET hash=?3, text=?4, vec=NULL",
+        "INSERT INTO chunks(path,idx,hash,text,vec) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(path,idx) DO UPDATE SET hash=?3, text=?4, vec=?5",
     )?;
     for (i, c) in chunks.iter().enumerate() {
         let h = hash(c);
         if old_hashes.get(&(i as i64)) != Some(&h) {
-            put.execute(params![path, i as i64, h, c])?;
+            put.execute(params![path, i as i64, h, c, old_vecs.get(&h)])?;
         }
     }
     tx.execute(
@@ -1325,6 +1354,80 @@ mod tests {
             0,
             "unchanged notes are skipped"
         );
+    }
+
+    #[test]
+    fn chunk_vectors_follow_their_text() {
+        let (_d, mut i) = idx();
+        i.chunking = true;
+        let section = |n: usize| {
+            let sentence = format!("Section {n} text. ");
+            format!("## S{n}\n\n{}", sentence.repeat(30))
+        };
+        let body = (0..4).map(section).collect::<Vec<_>>().join("\n\n");
+        i.upsert("a.md", &body, 1, 1, "t").unwrap();
+        // Fake vectors: [index at embedding time].
+        let rows: Vec<_> = i
+            .pending_chunks(100)
+            .unwrap()
+            .into_iter()
+            .map(|(p, n, h, _)| (p, n, h, vec![n as f32]))
+            .collect();
+        assert_eq!(rows.len(), 4);
+        i.store_vectors(&rows).unwrap();
+        assert_eq!(
+            i.rechunk_missing().unwrap(),
+            1,
+            "first run checks every note"
+        );
+        assert_eq!(i.rechunk_missing().unwrap(), 0);
+        assert_eq!(
+            i.load_vectors().unwrap().len(),
+            4,
+            "re-chunking keeps vectors"
+        );
+
+        // A new section at the top shifts every chunk down; their vectors move along.
+        let shifted = format!("## New\n\nFresh text.\n\n{body}");
+        i.upsert("a.md", &shifted, 1, 2, "t").unwrap();
+        let pending = i.pending_chunks(100).unwrap();
+        assert_eq!(pending.len(), 1, "only the new chunk needs a vector");
+        assert_eq!(pending[0].1, 0);
+        let vecs = i.load_vectors().unwrap();
+        assert_eq!(vecs.len(), 4);
+        assert!(vecs.iter().all(|(_, n, v)| *v == vec![(*n - 1) as f32]));
+
+        // A chunk the API rejects is skipped: not pending, not searched — until it changes.
+        let p = &pending[0];
+        i.store_vectors(&[(p.0.clone(), p.1, p.2.clone(), Vec::new())])
+            .unwrap();
+        assert!(i.pending_chunks(100).unwrap().is_empty());
+        assert_eq!(i.load_vectors().unwrap().len(), 4);
+        assert_eq!(i.embed_stats().unwrap(), (5, 5));
+        let edited = shifted.replace("Fresh text.", "Fresher text.");
+        i.upsert("a.md", &edited, 1, 3, "t").unwrap();
+        assert_eq!(i.pending_chunks(100).unwrap().len(), 1);
+
+        // Without an embedder only the waiting chunk goes; embedded ones stay.
+        assert_eq!(i.drop_pending_chunks().unwrap(), 1);
+        assert_eq!(i.embed_stats().unwrap(), (4, 4));
+        // Edited while semantic search is off: chunks aren't updated…
+        i.chunking = false;
+        let edited = edited.replace("Section 3 text.", "Section three.");
+        i.upsert("a.md", &edited, 1, 4, "t").unwrap();
+        assert_eq!(i.embed_stats().unwrap(), (4, 4));
+        // …so turning it back on re-chunks every note, keeping what still matches.
+        i.chunking = true;
+        assert_eq!(i.rechunk_missing().unwrap(), 1);
+        let pending: Vec<i64> = i
+            .pending_chunks(100)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.1)
+            .collect();
+        assert_eq!(pending, vec![0, 4]);
+        assert_eq!(i.load_vectors().unwrap().len(), 3);
+        assert_eq!(i.rechunk_missing().unwrap(), 0);
     }
 
     #[test]
