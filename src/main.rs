@@ -247,9 +247,13 @@ fn main() -> Result<()> {
                 .block_on(async move {
                     let listener = tokio::net::TcpListener::bind(&addr).await?;
                     tracing::info!("MindCrab listening on http://{addr}  (MCP: /mcp)");
-                    axum::serve(listener, router)
-                        .with_graceful_shutdown(shutdown())
-                        .await?;
+                    // Peer addresses feed the per-client login/MCP throttle.
+                    axum::serve(
+                        listener,
+                        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(shutdown())
+                    .await?;
                     Ok(())
                 })
         }

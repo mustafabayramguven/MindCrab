@@ -4,8 +4,8 @@ use crate::app::{AResult, App, AppError};
 use crate::mcp::{self, Session};
 use crate::scope::Scope;
 use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -14,8 +14,12 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const COOKIE: &str = "mindcrab_session";
 
@@ -32,6 +36,11 @@ pub struct Shared {
     pub app: Arc<App>,
     pub cfg: Config,
     sessions: Mutex<HashMap<String, String>>,
+    /// Failed web logins / API credentials, and failed MCP tokens, per client.
+    login_limit: Limiter,
+    mcp_limit: Limiter,
+    /// Last ETag of each index-backed list, with the index generation it was computed at.
+    list_tags: Mutex<HashMap<&'static str, (Gen, HeaderValue)>>,
 }
 
 type St = State<Arc<Shared>>;
@@ -144,7 +153,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/remove-line", post(remove_line))
         .route("/preview", get(preview))
         .route("/canvas", get(get_canvas).put(put_canvas))
-        .layer(middleware::from_fn(etag))
+        .layer(middleware::from_fn_with_state(shared.clone(), etag))
         .layer(middleware::from_fn_with_state(shared.clone(), require_auth))
         .route("/login", post(login))
         .route("/logout", post(logout))
@@ -152,10 +161,17 @@ pub fn router(shared: Arc<Shared>) -> Router {
 
     Router::new()
         .nest("/api", api)
+        // Trailing-slash variants too: a connector URL ending in `/` would otherwise
+        // hit the web UI and get 405 for POST.
         .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_delete))
+        .route("/mcp/", post(mcp_post).get(mcp_get).delete(mcp_delete))
         .route(
             "/mcp/{token}",
-            post(mcp_post_path).get(mcp_get).delete(mcp_delete),
+            post(mcp_post_path).get(mcp_get).delete(mcp_delete_path),
+        )
+        .route(
+            "/mcp/{token}/",
+            post(mcp_post_path).get(mcp_get).delete(mcp_delete_path),
         )
         .merge(crate::web::routes())
         .layer(DefaultBodyLimit::max(
@@ -166,20 +182,106 @@ pub fn router(shared: Arc<Shared>) -> Router {
                 .gzip(true)
                 .br(true),
         )
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(|req: &Request| {
+                tracing::debug_span!(
+                    "request",
+                    method = %req.method(),
+                    uri = %log_uri(req.uri()),
+                    version = ?req.version(),
+                )
+            }),
+        )
         .with_state(shared)
+}
+
+/// Request URI for logs, with the secret part of `/mcp/{token}` URLs masked.
+fn log_uri(uri: &Uri) -> String {
+    match uri.path().strip_prefix("/mcp/") {
+        Some(rest) if !rest.is_empty() => "/mcp/<token>".into(),
+        _ => uri.to_string(),
+    }
 }
 
 /// Largest JSON body the ETag layer buffers; bigger responses pass through untouched.
 const ETAG_MAX: u64 = 32 << 20;
 
+/// Index generation: rows written through the index connection (`total_changes`),
+/// commits made by any other connection (`data_version`), and the `.mcpignore` mtime.
+type Gen = (u64, i64, Option<std::time::SystemTime>);
+
+/// GET endpoints whose JSON depends only on the index (and `.mcpignore`), so an unchanged
+/// [`Gen`] means an unchanged body.
+fn gen_route(path: &str) -> Option<&'static str> {
+    match path.strip_prefix("/api").unwrap_or(path) {
+        "/tree" => Some("tree"),
+        "/tags" => Some("tags"),
+        "/graph" => Some("graph"),
+        _ => None,
+    }
+}
+
+fn index_gen(app: &App) -> AResult<Gen> {
+    let idx = app.idx();
+    let version: i64 = idx
+        .conn
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .map_err(anyhow::Error::from)?;
+    let changes = idx.conn.total_changes();
+    drop(idx);
+    let ignore = std::fs::metadata(app.vault.root().join(crate::features::IGNORE_FILE))
+        .and_then(|m| m.modified())
+        .ok();
+    Ok((changes, version, ignore))
+}
+
+fn etag_matches(inm: Option<&HeaderValue>, tag: &HeaderValue) -> bool {
+    inm.is_some_and(|v| {
+        v.as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii() == tag.as_bytes())
+    })
+}
+
+fn not_modified(tag: HeaderValue) -> Response {
+    let mut r = StatusCode::NOT_MODIFIED.into_response();
+    r.headers_mut().insert(header::ETAG, tag);
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    r
+}
+
 /// Weak ETag over the JSON body for GET requests, answering 304 when the client
-/// already has it — the UI polls the tree and tags, which rarely change.
-async fn etag(req: Request, next: Next) -> Response {
+/// already has it — the UI polls the tree and tags, which rarely change. For the
+/// index-backed lists, a 304 is answered from the index generation alone, without
+/// running the query.
+async fn etag(State(st): St, req: Request, next: Next) -> Response {
     if req.method() != axum::http::Method::GET {
         return next.run(req).await;
     }
     let inm = req.headers().get(header::IF_NONE_MATCH).cloned();
+    let route = gen_route(req.uri().path());
+    // Read before the handler runs: a write racing the query then only costs a miss.
+    let generation = match route {
+        Some(_) => run(&st, index_gen).await.ok(),
+        None => None,
+    };
+    if let (Some(r), Some(g)) = (route, generation.as_ref()) {
+        let known = st
+            .list_tags
+            .lock()
+            .unwrap()
+            .get(r)
+            .filter(|(at, _)| at == g)
+            .map(|(_, tag)| tag.clone());
+        if let Some(tag) = known
+            && etag_matches(inm.as_ref(), &tag)
+        {
+            return not_modified(tag);
+        }
+    }
     let res = next.run(req).await;
     let json = res
         .headers()
@@ -201,23 +303,16 @@ async fn etag(req: Request, next: Next) -> Response {
         format!("W/\"{}\"", hex::encode(&Sha256::digest(&bytes)[..12]))
     };
     let tag = HeaderValue::from_str(&tag).expect("hex etag");
+    if let (Some(r), Some(g)) = (route, generation) {
+        st.list_tags.lock().unwrap().insert(r, (g, tag.clone()));
+    }
+    if etag_matches(inm.as_ref(), &tag) {
+        return not_modified(tag);
+    }
     parts.headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-cache"),
     );
-    if inm.as_ref().is_some_and(|v| {
-        v.as_bytes()
-            .split(|b| *b == b',')
-            .any(|t| t.trim_ascii() == tag.as_bytes())
-    }) {
-        let mut r = StatusCode::NOT_MODIFIED.into_response();
-        r.headers_mut().insert(header::ETAG, tag);
-        r.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-cache"),
-        );
-        return r;
-    }
     parts.headers.insert(header::ETAG, tag);
     Response::from_parts(parts, Body::from(bytes))
 }
@@ -227,16 +322,34 @@ pub fn shared(app: Arc<App>, cfg: Config) -> Arc<Shared> {
         app,
         cfg,
         sessions: Mutex::new(HashMap::new()),
+        login_limit: Limiter::new(),
+        mcp_limit: Limiter::new(),
+        list_tags: Mutex::new(HashMap::new()),
     })
 }
 
 async fn require_auth(State(st): St, jar: CookieJar, req: Request, next: Next) -> Response {
-    let ok = bearer(req.headers()).is_some_and(|t| eq(t, &st.cfg.web_token))
-        || jar
-            .get(COOKIE)
-            .is_some_and(|c| eq(c.value(), &st.cfg.web_token));
-    if !ok {
-        return ApiError(StatusCode::UNAUTHORIZED, "login required".into()).into_response();
+    let login_required =
+        || ApiError(StatusCode::UNAUTHORIZED, "login required".into()).into_response();
+    let presented: Vec<String> = bearer(req.headers())
+        .into_iter()
+        .chain(jar.get(COOKIE).map(|c| c.value()))
+        .map(str::to_string)
+        .collect();
+    if presented.is_empty() {
+        return login_required();
+    }
+    // A bearer header or cookie is a guess at the web token like a login is, so it is
+    // throttled the same way — and refused unchecked while the client is locked out.
+    let who = client_key(req.extensions(), req.headers());
+    if let Err(wait) = st.login_limit.check(&who) {
+        return too_many(wait);
+    }
+    if !presented.iter().any(|t| eq(t, &st.cfg.web_token)) {
+        for t in &presented {
+            st.login_limit.fail(&who, t);
+        }
+        return login_required();
     }
     next.run(req).await
 }
@@ -246,11 +359,24 @@ struct LoginReq {
     token: String,
 }
 
-async fn login(State(st): St, jar: CookieJar, Json(r): Json<LoginReq>) -> Response {
-    if !eq(r.token.trim(), &st.cfg.web_token) {
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+async fn login(
+    State(st): St,
+    ext: Extensions,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(r): Json<LoginReq>,
+) -> Response {
+    let who = client_key(&ext, &headers);
+    if let Err(wait) = st.login_limit.check(&who) {
+        return too_many(wait);
+    }
+    let token = r.token.trim();
+    if !eq(token, &st.cfg.web_token) {
+        st.login_limit.fail(&who, token);
+        tokio::time::sleep(Duration::from_millis(800)).await;
         return ApiError(StatusCode::UNAUTHORIZED, "wrong token".into()).into_response();
     }
+    st.login_limit.clear(&who);
     let cookie = Cookie::build((COOKIE, st.cfg.web_token.clone()))
         .http_only(true)
         .same_site(SameSite::Strict)
@@ -565,12 +691,140 @@ async fn upload(State(st): St, Query(q): Query<UploadQ>, body: Bytes) -> ApiResu
     .await
 }
 
-async fn file(State(st): St, Path(path): Path<String>) -> ApiResult<Response> {
+/// Files up to this size are read in one go; bigger ones are streamed from disk.
+const STREAM_ABOVE: u64 = 256 << 10;
+
+/// Absolute path and size of a vault file, refusing anything a symlink would take
+/// outside the vault.
+fn vault_file(app: &App, path: &str) -> AResult<(std::path::PathBuf, u64)> {
+    let clean =
+        crate::vault::Vault::clean(path).map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let missing = || AppError::NotFound(format!("file not found: {clean}"));
+    let real = app
+        .vault
+        .abs(&clean)
+        .canonicalize()
+        .map_err(|_| missing())?;
+    let meta = std::fs::metadata(&real).map_err(|_| missing())?;
+    if !real.starts_with(app.vault.root()) || !meta.is_file() {
+        return Err(missing());
+    }
+    Ok((real, meta.len()))
+}
+
+#[derive(Debug, PartialEq)]
+enum ByteRange {
+    Whole,
+    /// Inclusive first and last byte.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+/// Parses a `Range` header against a file of `size` bytes. Only a single `bytes=` range is
+/// honoured (what media players and PDF viewers send); anything else gets the whole
+/// file, which RFC 9110 allows.
+fn byte_range(spec: Option<&str>, size: u64) -> ByteRange {
+    let Some(spec) = spec.map(str::trim) else {
+        return ByteRange::Whole;
+    };
+    let Some(set) = spec
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| &spec[6..])
+    else {
+        return ByteRange::Whole;
+    };
+    let Some((a, b)) = set.split_once('-').filter(|_| !set.contains(',')) else {
+        return ByteRange::Whole;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() {
+        // Suffix range: the last `n` bytes.
+        return match b.parse::<u64>() {
+            Ok(0) => ByteRange::Unsatisfiable,
+            Ok(_) if size == 0 => ByteRange::Unsatisfiable,
+            Ok(n) => ByteRange::Part(size.saturating_sub(n), size - 1),
+            Err(_) => ByteRange::Whole,
+        };
+    }
+    let Ok(start) = a.parse::<u64>() else {
+        return ByteRange::Whole;
+    };
+    let end = match b {
+        "" => u64::MAX,
+        b => match b.parse::<u64>() {
+            Ok(e) if e >= start => e,
+            _ => return ByteRange::Whole,
+        },
+    };
+    if start >= size {
+        return ByteRange::Unsatisfiable;
+    }
+    ByteRange::Part(start, end.min(size - 1))
+}
+
+enum FileBody {
+    Memory(Bytes),
+    Disk(tokio::fs::File),
+}
+
+async fn file(State(st): St, Path(path): Path<String>, headers: HeaderMap) -> ApiResult<Response> {
     let p = path.clone();
-    let bytes = run(&st, move |app| app.read_file(&p)).await?;
+    let (abs, size) = run(&st, move |app| vault_file(app, &p)).await?;
+    let io_err = |e: std::io::Error| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    let (source, size) = if size <= STREAM_ABOVE {
+        let p = path.clone();
+        let bytes = Bytes::from(run(&st, move |app| app.read_file(&p)).await?);
+        let n = bytes.len() as u64;
+        (FileBody::Memory(bytes), n)
+    } else {
+        let f = tokio::fs::File::open(&abs).await.map_err(io_err)?;
+        (FileBody::Disk(f), size)
+    };
+    // A conditional range (`If-Range`) cannot match: we send no validators.
+    let range = headers
+        .get(header::RANGE)
+        .filter(|_| !headers.contains_key(header::IF_RANGE))
+        .and_then(|v| v.to_str().ok());
+    let (start, len, partial) = match byte_range(range, size) {
+        ByteRange::Whole => (0, size, false),
+        ByteRange::Part(a, b) => (a, b - a + 1, true),
+        ByteRange::Unsatisfiable => {
+            let mut r = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            r.headers_mut().insert(
+                header::CONTENT_RANGE,
+                HeaderValue::from_str(&format!("bytes */{size}")).expect("ascii"),
+            );
+            return Ok(r);
+        }
+    };
+    let body = match source {
+        FileBody::Memory(b) => Body::from(b.slice(start as usize..(start + len) as usize)),
+        FileBody::Disk(mut f) => {
+            if start > 0 {
+                f.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .map_err(io_err)?;
+            }
+            Body::from_stream(tokio_util::io::ReaderStream::with_capacity(
+                f.take(len),
+                64 << 10,
+            ))
+        }
+    };
     let mime = mime_guess::from_path(&path).first_or_octet_stream();
-    let mut resp = Response::new(Body::from(bytes));
+    let mut resp = Response::new(body);
     let h = resp.headers_mut();
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    if partial {
+        // A 206 also keeps the compression layer away from media streams.
+        h.insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{}/{size}", start + len - 1))
+                .expect("ascii"),
+        );
+    }
     // SVG and HTML could run scripts when opened directly; sandbox them.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -605,6 +859,9 @@ async fn file(State(st): St, Path(path): Path<String>) -> ApiResult<Response> {
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=300"),
     );
+    if partial {
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
     Ok(resp)
 }
 
@@ -649,37 +906,82 @@ async fn resolve_scope(st: &Arc<Shared>, token: &str) -> Option<(Scope, bool)> {
         .map(|s| (s, true))
 }
 
-async fn mcp_post(State(st): St, headers: HeaderMap, body: Bytes) -> Response {
-    let scope = match bearer(&headers) {
-        Some(t) => resolve_scope(&st, t).await,
-        None => None,
+fn mcp_unauthorized() -> Response {
+    let mut r = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "invalid or missing MCP token"})),
+    )
+        .into_response();
+    r.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"mindcrab\""),
+    );
+    r
+}
+
+/// Resolves the token of an MCP request (bearer header or `/mcp/{token}` path). A wrong
+/// token is answered 401 (a 404 made MCP clients report "not implemented"); failures
+/// are throttled per client.
+// The error is a ready-made axum Response, returned straight to the client.
+#[allow(clippy::result_large_err)]
+async fn mcp_auth(
+    st: &Arc<Shared>,
+    ext: &Extensions,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Result<(Scope, bool), Response> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Err(mcp_unauthorized());
     };
-    let Some(scope) = scope else {
-        let mut r = (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "invalid or missing bearer token"})),
-        )
-            .into_response();
-        r.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"mindcrab\""),
-        );
-        return r;
-    };
-    mcp_dispatch(st, headers, body, scope).await
+    let who = client_key(ext, headers);
+    st.mcp_limit.check(&who).map_err(too_many)?;
+    if let Some(scope) = resolve_scope(st, token).await {
+        return Ok(scope);
+    }
+    st.mcp_limit.fail(&who, token);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Err(mcp_unauthorized())
+}
+
+async fn mcp_post(State(st): St, ext: Extensions, headers: HeaderMap, body: Bytes) -> Response {
+    let auth = mcp_auth(&st, &ext, &headers, bearer(&headers)).await;
+    match auth {
+        Ok(scope) => mcp_dispatch(st, headers, body, scope).await,
+        Err(r) => r,
+    }
 }
 
 async fn mcp_post_path(
     State(st): St,
     Path(token): Path<String>,
+    ext: Extensions,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(scope) = resolve_scope(&st, &token).await else {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    };
-    mcp_dispatch(st, headers, body, scope).await
+    let auth = mcp_auth(&st, &ext, &headers, Some(&token)).await;
+    match auth {
+        Ok(scope) => mcp_dispatch(st, headers, body, scope).await,
+        Err(r) => r,
+    }
+}
+
+/// The `MCP-Protocol-Version` (header or 2026-style `_meta`) of a non-`initialize`
+/// request, when this server does not speak it.
+fn unsupported_version(headers: &HeaderMap, msg: &Value) -> Option<String> {
+    if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+        return None;
+    }
+    let header = headers
+        .get("mcp-protocol-version")
+        .map(|v| v.to_str().unwrap_or("?").trim().to_string());
+    let meta = msg
+        .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    [header, meta]
+        .into_iter()
+        .flatten()
+        .find(|v| !mcp::SUPPORTED_VERSIONS.contains(&v.as_str()))
 }
 
 async fn mcp_dispatch(
@@ -698,6 +1000,22 @@ async fn mcp_dispatch(
                 .into_response();
         }
     };
+    // Spec (2025-06-18+): unsupported protocol version → 400. The plain JSON-RPC error
+    // (not a 2026 "modern" one) tells dual-era clients to fall back to `initialize`.
+    if let Some(v) = unsupported_version(&headers, &msg) {
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        let message = format!(
+            "unsupported MCP-Protocol-Version {v:?}; supported: {} (start with initialize)",
+            mcp::SUPPORTED_VERSIONS.join(", ")
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}}),
+            ),
+        )
+            .into_response();
+    }
     let is_init = msg.get("method").and_then(Value::as_str) == Some("initialize");
     let sid_in = headers
         .get("mcp-session-id")
@@ -760,11 +1078,188 @@ async fn mcp_get() -> Response {
     r
 }
 
-async fn mcp_delete(State(st): St, headers: HeaderMap) -> StatusCode {
+fn end_session(st: &Shared, headers: &HeaderMap) -> Response {
     if let Some(sid) = headers.get("mcp-session-id").and_then(|h| h.to_str().ok()) {
         st.sessions.lock().unwrap().remove(sid);
     }
-    StatusCode::OK
+    StatusCode::OK.into_response()
+}
+
+/// Session termination needs the same credentials as the requests of the session.
+async fn mcp_delete(State(st): St, ext: Extensions, headers: HeaderMap) -> Response {
+    let auth = mcp_auth(&st, &ext, &headers, bearer(&headers)).await;
+    match auth {
+        Ok(_) => end_session(&st, &headers),
+        Err(r) => r,
+    }
+}
+
+async fn mcp_delete_path(
+    State(st): St,
+    Path(token): Path<String>,
+    ext: Extensions,
+    headers: HeaderMap,
+) -> Response {
+    let auth = mcp_auth(&st, &ext, &headers, Some(&token)).await;
+    match auth {
+        Ok(_) => end_session(&st, &headers),
+        Err(r) => r,
+    }
+}
+
+// ------------------------------------------------------------------ auth throttling
+
+/// Rate-limit key for a client: its IP address (IPv6 by /64). When the peer is a
+/// reverse proxy on a loopback/private address, the last `X-Forwarded-For` hop — the
+/// address the proxy itself saw — names the client instead.
+fn client_key(ext: &Extensions, headers: &HeaderMap) -> String {
+    let Some(ConnectInfo(peer)) = ext.get::<ConnectInfo<SocketAddr>>() else {
+        return "-".into();
+    };
+    let mut ip = canonical_ip(peer.ip());
+    if is_local(ip)
+        && let Some(fwd) = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+    {
+        ip = canonical_ip(fwd);
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+fn is_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => v.is_loopback() || v.is_private() || v.is_link_local(),
+        // Loopback, unique-local (fc00::/7) and link-local (fe80::/10).
+        IpAddr::V6(v) => {
+            v.is_loopback()
+                || (v.segments()[0] & 0xfe00) == 0xfc00
+                || (v.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn too_many(wait: Duration) -> Response {
+    let mut r = ApiError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too many failed attempts, try again later".into(),
+    )
+    .into_response();
+    r.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(wait.as_secs() + 1));
+    r
+}
+
+/// Free failed attempts before a client is locked out.
+const FREE_FAILS: u32 = 5;
+const MAX_LOCK: Duration = Duration::from_secs(300);
+/// A client's failures are forgotten after this long without a new one.
+const FORGET_AFTER: Duration = Duration::from_secs(15 * 60);
+const MAX_CLIENTS: usize = 4096;
+/// Shared bucket for new clients while the table is full of active ones.
+const OVERFLOW: &str = "*";
+
+/// Failed-authentication throttle per client: a few free attempts, then an exponential
+/// lockout (1 s, 2 s, 4 s … up to 5 min). While locked out, requests are refused before
+/// the credential is compared, so firing many requests in parallel buys no extra
+/// guesses. Repeating the same wrong credential (a stale cookie, a misconfigured MCP
+/// client) counts once.
+struct Limiter {
+    clients: Mutex<HashMap<String, Strikes>>,
+    hasher: std::collections::hash_map::RandomState,
+}
+
+struct Strikes {
+    fails: u32,
+    last: Instant,
+    until: Option<Instant>,
+    /// Hashes of the latest distinct wrong credentials.
+    recent: [u64; 4],
+}
+
+impl Limiter {
+    fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+            hasher: Default::default(),
+        }
+    }
+
+    fn slot<'k>(map: &HashMap<String, Strikes>, key: &'k str) -> &'k str {
+        if map.contains_key(key) || map.len() < MAX_CLIENTS {
+            key
+        } else {
+            OVERFLOW
+        }
+    }
+
+    /// `Err(retry_after)` while `key` is locked out.
+    fn check(&self, key: &str) -> Result<(), Duration> {
+        let map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match map.get(Self::slot(&map, key)).and_then(|s| s.until) {
+            Some(until) if until > now => Err(until - now),
+            _ => Ok(()),
+        }
+    }
+
+    fn fail(&self, key: &str, credential: &str) {
+        let hash = self.hasher.hash_one(credential);
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let active = |s: &Strikes| {
+            s.until.is_some_and(|u| u > now) || now.duration_since(s.last) < FORGET_AFTER
+        };
+        if !map.contains_key(key) && map.len() >= MAX_CLIENTS {
+            map.retain(|_, s| active(s));
+        }
+        let slot = Self::slot(&map, key).to_string();
+        let s = map.entry(slot).or_insert(Strikes {
+            fails: 0,
+            last: now,
+            until: None,
+            recent: [0; 4],
+        });
+        if !active(s) {
+            s.fails = 0;
+            s.recent = [0; 4];
+        }
+        s.last = now;
+        if s.recent.contains(&hash) {
+            return;
+        }
+        s.recent.rotate_right(1);
+        s.recent[0] = hash;
+        s.fails = s.fails.saturating_add(1);
+        if s.fails >= FREE_FAILS {
+            let lock = Duration::from_secs(1 << (s.fails - FREE_FAILS).min(16));
+            s.until = Some(now + lock.min(MAX_LOCK));
+        }
+    }
+
+    fn clear(&self, key: &str) {
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
 }
 
 // ------------------------------------------------------------------ privacy & connections
@@ -1067,4 +1562,118 @@ async fn append(State(st): St, Json(r): Json<AppendReq>) -> ApiResult<Json<Value
         ))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limiter_locks_out_after_free_attempts() {
+        let l = Limiter::new();
+        for i in 0..FREE_FAILS - 1 {
+            assert!(l.check("1.2.3.4").is_ok());
+            l.fail("1.2.3.4", &format!("guess{i}"));
+        }
+        // The same wrong credential again (stale cookie) does not count.
+        l.fail("1.2.3.4", "guess0");
+        assert!(l.check("1.2.3.4").is_ok());
+        l.fail("1.2.3.4", "another");
+        assert!(l.check("1.2.3.4").is_err());
+        assert!(l.check("5.6.7.8").is_ok(), "other clients are not affected");
+        l.clear("1.2.3.4");
+        assert!(l.check("1.2.3.4").is_ok());
+    }
+
+    #[test]
+    fn limiter_table_is_bounded() {
+        let l = Limiter::new();
+        for i in 0..MAX_CLIENTS + 50 {
+            l.fail(&format!("c{i}"), "x");
+        }
+        assert!(l.clients.lock().unwrap().len() <= MAX_CLIENTS + 1);
+        // New clients share the overflow bucket, which locks out like any other.
+        for i in 0..FREE_FAILS {
+            l.fail("new", &format!("g{i}"));
+        }
+        assert!(l.check("new").is_err() && l.check("newer").is_err());
+    }
+
+    #[test]
+    fn client_keys() {
+        let ext = |addr: &str| {
+            let mut e = Extensions::new();
+            e.insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
+            e
+        };
+        let mut fwd = HeaderMap::new();
+        fwd.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("6.6.6.6, 9.8.7.6"),
+        );
+        assert_eq!(client_key(&ext("127.0.0.1:1"), &fwd), "9.8.7.6");
+        assert_eq!(client_key(&ext("172.18.0.2:1"), &fwd), "9.8.7.6");
+        // A public peer cannot pick its own key.
+        assert_eq!(client_key(&ext("1.2.3.4:1"), &fwd), "1.2.3.4");
+        let none = HeaderMap::new();
+        assert_eq!(
+            client_key(&ext("[2001:db8:1:2:3::4]:1"), &none),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(client_key(&ext("[::ffff:1.2.3.4]:1"), &none), "1.2.3.4");
+        assert_eq!(client_key(&Extensions::new(), &none), "-");
+    }
+
+    #[test]
+    fn byte_ranges() {
+        use ByteRange::*;
+        assert_eq!(byte_range(None, 10), Whole);
+        assert_eq!(byte_range(Some("bytes=0-"), 10), Part(0, 9));
+        assert_eq!(byte_range(Some("bytes=2-4"), 10), Part(2, 4));
+        assert_eq!(byte_range(Some("bytes=5-100"), 10), Part(5, 9));
+        assert_eq!(byte_range(Some("bytes=-3"), 10), Part(7, 9));
+        assert_eq!(byte_range(Some("bytes=-30"), 10), Part(0, 9));
+        assert_eq!(byte_range(Some("bytes=10-"), 10), Unsatisfiable);
+        assert_eq!(byte_range(Some("bytes=-0"), 10), Unsatisfiable);
+        assert_eq!(byte_range(Some("bytes=0-1,4-5"), 10), Whole);
+        assert_eq!(byte_range(Some("bytes=4-2"), 10), Whole);
+        assert_eq!(byte_range(Some("items=0-1"), 10), Whole);
+        assert_eq!(byte_range(Some("bytes=x-"), 10), Whole);
+    }
+
+    #[test]
+    fn mcp_token_is_not_logged() {
+        let uri: Uri = "/mcp/mc_secret?x=1".parse().unwrap();
+        assert_eq!(log_uri(&uri), "/mcp/<token>");
+        let uri: Uri = "/api/tree?x=1".parse().unwrap();
+        assert_eq!(log_uri(&uri), "/api/tree?x=1");
+    }
+
+    #[test]
+    fn protocol_version_header() {
+        let mut h = HeaderMap::new();
+        let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        assert_eq!(unsupported_version(&h, &list), None);
+        h.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-06-18"),
+        );
+        assert_eq!(unsupported_version(&h, &list), None);
+        h.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2026-07-28"),
+        );
+        assert_eq!(
+            unsupported_version(&h, &list).as_deref(),
+            Some("2026-07-28")
+        );
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        assert_eq!(unsupported_version(&h, &init), None);
+        let modern = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover",
+            "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}});
+        assert!(unsupported_version(&HeaderMap::new(), &modern).is_some());
+        assert_eq!(gen_route("/tree"), Some("tree"));
+        assert_eq!(gen_route("/api/graph"), Some("graph"));
+        assert_eq!(gen_route("/note"), None);
+    }
 }
