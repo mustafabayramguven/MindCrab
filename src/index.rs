@@ -621,7 +621,7 @@ impl Index {
             "path COLLATE NOCASE"
         };
         let sql = format!(
-            "SELECT path,title,mtime,size,{TAGS_SQL} FROM notes n WHERE (?1 = '' OR path LIKE ?1 || '/%') ORDER BY {order} LIMIT ?2"
+            "SELECT path,title,mtime,size,{TAGS_SQL} FROM notes n WHERE (?1 = '' OR path LIKE ?1 ESCAPE '\\') ORDER BY {order} LIMIT ?2"
         );
         let big = limit > 500;
         let sql = if big {
@@ -630,7 +630,7 @@ impl Index {
             sql
         };
         let mut st = self.conn.prepare(&sql)?;
-        let folder = folder.unwrap_or("").trim_matches('/');
+        let folder = folder_pattern(folder.unwrap_or(""));
         let rows = st
             .query_map(params![folder, limit as i64], |r| {
                 Ok(NoteMeta {
@@ -665,76 +665,48 @@ impl Index {
     /// Full-text search. Supports `tag:x`, `path:folder` and `"exact phrase"`.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let parsed = parse_query(query);
-        let mut hits = Vec::new();
-
-        if parsed.fts.is_empty() {
+        let folder = folder_pattern(parsed.folder.as_deref().unwrap_or(""));
+        let limit = limit as i64;
+        // Tag filters run in SQL, so LIMIT never cuts off the notes carrying a rare tag.
+        let mut args: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        let sql = if parsed.fts.is_empty() {
             // Filter-only query: list matching notes by recency.
-            for m in self.list(parsed.folder.as_deref(), true, 10_000)? {
-                if parsed.tags.iter().all(|t| {
-                    m.tags
-                        .iter()
-                        .any(|x| x == t || x.starts_with(&format!("{t}/")))
-                }) {
-                    hits.push(SearchHit {
-                        path: m.path,
-                        title: m.title,
-                        snippet: String::new(),
-                        tags: m.tags,
-                        mtime: m.mtime,
-                        semantic: false,
-                    });
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
-            }
-            return Ok(hits);
-        }
-
-        let sql = format!(
-            "SELECT f.path, n.title, snippet(notes_fts, 2, '{SNIP_START}', '{SNIP_END}', '…', 16), n.mtime, {TAGS_SQL}
-             FROM notes_fts f JOIN notes n ON n.path = f.path
-             WHERE notes_fts MATCH ?1 AND (?2 = '' OR f.path LIKE ?2 || '/%')
-             ORDER BY bm25(notes_fts, 0.0, 8.0, 1.0, 4.0) LIMIT ?3"
-        );
-        let mut st = self.conn.prepare(&sql)?;
-        let folder = parsed.folder.clone().unwrap_or_default();
-        // Over-fetch only when tag filters may drop rows: each row's snippet is costly.
-        let fetch = if parsed.tags.is_empty() {
-            limit
+            args.push(&folder);
+            args.push(&limit);
+            format!(
+                "SELECT n.path, n.title, '', n.mtime, {TAGS_SQL} FROM notes n
+                 WHERE (?1 = '' OR n.path LIKE ?1 ESCAPE '\\'){}
+                 ORDER BY n.mtime DESC LIMIT ?2",
+                tag_filter_sql(3, parsed.tags.len())
+            )
         } else {
-            limit * 4
+            args.push(&parsed.fts);
+            args.push(&folder);
+            args.push(&limit);
+            format!(
+                "SELECT f.path, n.title, snippet(notes_fts, 2, '{SNIP_START}', '{SNIP_END}', '…', 16), n.mtime, {TAGS_SQL}
+                 FROM notes_fts f JOIN notes n ON n.path = f.path
+                 WHERE notes_fts MATCH ?1 AND (?2 = '' OR f.path LIKE ?2 ESCAPE '\\'){}
+                 ORDER BY bm25(notes_fts, 0.0, 8.0, 1.0, 4.0) LIMIT ?3",
+                tag_filter_sql(4, parsed.tags.len())
+            )
         };
-        let rows = st.query_map(params![parsed.fts, folder, fetch as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                split_tags(r.get(4)?),
-            ))
-        })?;
-        for row in rows {
-            let (path, title, snippet, mtime, t) = row?;
-            if !parsed
-                .tags
-                .iter()
-                .all(|q| t.iter().any(|x| x == q || x.starts_with(&format!("{q}/"))))
-            {
-                continue;
-            }
-            hits.push(SearchHit {
-                path,
-                title,
-                snippet,
-                tags: t,
-                mtime,
-                semantic: false,
-            });
-            if hits.len() >= limit {
-                break;
-            }
+        for t in &parsed.tags {
+            args.push(t);
         }
+        let mut st = self.conn.prepare(&sql)?;
+        let hits = st
+            .query_map(args.as_slice(), |r| {
+                Ok(SearchHit {
+                    path: r.get(0)?,
+                    title: r.get(1)?,
+                    snippet: r.get(2)?,
+                    tags: split_tags(r.get(4)?),
+                    mtime: r.get(3)?,
+                    semantic: false,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(hits)
     }
 
@@ -1115,27 +1087,15 @@ impl Resolver {
             target = &joined;
         }
         let lower = target.to_lowercase();
-        let ext = lower
-            .rsplit_once('.')
-            .map(|(_, e)| e)
-            .filter(|e| *e != "md" && e.len() <= 5);
         let src_dir = note::parent_dir(src);
 
-        if ext.is_some() {
-            let k = lower.trim_start_matches("./").trim_start_matches('/');
-            if let Some(p) = self.files_by_key.get(k) {
-                return Some(p.clone());
-            }
-            let rel = if src_dir.is_empty() {
-                k.to_string()
-            } else {
-                format!("{}/{k}", src_dir.to_lowercase())
-            };
-            if let Some(p) = self.files_by_key.get(&rel) {
-                return Some(p.clone());
-            }
-            let name = k.rsplit('/').next().unwrap_or(k);
-            return pick(self.files_by_name.get(name)?, src_dir);
+        // A dotted name is an attachment (`pic.png`) or a note (`v1.2`, `Node.js`):
+        // like Obsidian, try the file first, then fall back to notes.
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        if name.rsplit_once('.').is_some_and(|(_, e)| e != "md")
+            && let Some(p) = self.resolve_file(&lower, src_dir)
+        {
+            return Some(p);
         }
 
         let key = note::normalize_key(target);
@@ -1154,7 +1114,7 @@ impl Resolver {
         let cands: Vec<String> = if key.contains('/') {
             cands
                 .iter()
-                .filter(|p| note::normalize_key(p).ends_with(&key))
+                .filter(|p| is_path_suffix(&note::normalize_key(p), &key))
                 .cloned()
                 .collect()
         } else {
@@ -1162,6 +1122,70 @@ impl Resolver {
         };
         pick(&cands, src_dir)
     }
+
+    /// Attachment lookup for a lowercased target with an extension.
+    fn resolve_file(&self, lower: &str, src_dir: &str) -> Option<String> {
+        let k = lower.trim_start_matches("./").trim_start_matches('/');
+        if let Some(p) = self.files_by_key.get(k) {
+            return Some(p.clone());
+        }
+        if !src_dir.is_empty()
+            && let Some(p) = self
+                .files_by_key
+                .get(&format!("{}/{k}", src_dir.to_lowercase()))
+        {
+            return Some(p.clone());
+        }
+        let name = k.rsplit('/').next().unwrap_or(k);
+        let cands = self.files_by_name.get(name)?;
+        if !k.contains('/') {
+            return pick(cands, src_dir);
+        }
+        let cands: Vec<String> = cands
+            .iter()
+            .filter(|p| is_path_suffix(&p.to_lowercase(), k))
+            .cloned()
+            .collect();
+        pick(&cands, src_dir)
+    }
+}
+
+/// Whether `path` is `key` or ends with `/key`: `[[ar/Not]]` must not match `bar/Not.md`.
+fn is_path_suffix(path: &str, key: &str) -> bool {
+    path.strip_suffix(key)
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('/'))
+}
+
+/// LIKE pattern for the paths inside `folder` ("" for no folder), with `%`, `_` and `\`
+/// in the name taken literally (use with `ESCAPE '\'`).
+fn folder_pattern(folder: &str) -> String {
+    let folder = folder.trim_matches('/');
+    if folder.is_empty() {
+        return String::new();
+    }
+    let mut p = String::with_capacity(folder.len() + 2);
+    for c in folder.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    p.push_str("/%");
+    p
+}
+
+/// SQL conditions requiring note `n` to carry each tag bound at `?first`, `?first+1`, …
+/// A tag also matches its nested tags (`proj` → `proj/a`), which sort from `proj/` up to
+/// `proj0` (`0` follows `/` in ASCII); a range keeps the `tags(path, tag)` index usable.
+fn tag_filter_sql(first: usize, count: usize) -> String {
+    let mut sql = String::new();
+    for i in first..first + count {
+        sql.push_str(&format!(
+            " AND EXISTS(SELECT 1 FROM tags t WHERE t.path = n.path \
+             AND (t.tag = ?{i} OR (t.tag >= ?{i} || '/' AND t.tag < ?{i} || '0')))"
+        ));
+    }
+    sql
 }
 
 fn pick(cands: &[String], src_dir: &str) -> Option<String> {
@@ -1406,5 +1430,105 @@ mod tests {
             i.resolve_link("y/src.md", "pic.png").unwrap().as_deref(),
             Some("attachments/pic.png")
         );
+    }
+
+    #[test]
+    fn resolver_dotted_names_and_path_boundaries() {
+        let (_d, mut i) = idx();
+        for p in [
+            "v1.2.md",
+            "Tech/Node.js.md",
+            "Günlük/2026.11.md",
+            "bar/Not.md",
+            "README.MD",
+        ] {
+            i.upsert(p, "", 0, 0, "t").unwrap();
+        }
+        i.upsert_file("docs/report.pdf", 1, 1).unwrap();
+        i.upsert_file("x/assets/pic.png", 1, 1).unwrap();
+        let r = |t: &str| i.resolve_link("top.md", t).unwrap();
+        assert_eq!(r("v1.2").as_deref(), Some("v1.2.md"));
+        assert_eq!(r("Node.js").as_deref(), Some("Tech/Node.js.md"));
+        assert_eq!(r("2026.11").as_deref(), Some("Günlük/2026.11.md"));
+        assert_eq!(r("report.pdf").as_deref(), Some("docs/report.pdf"));
+        assert_eq!(r("missing.v2"), None);
+        assert_eq!(r("readme").as_deref(), Some("README.MD"));
+        assert_eq!(r("README.md").as_deref(), Some("README.MD"));
+        assert_eq!(r("bar/Not").as_deref(), Some("bar/Not.md"));
+        assert_eq!(
+            r("ar/Not"),
+            None,
+            "a suffix must start at a folder boundary"
+        );
+        assert_eq!(r("assets/pic.png").as_deref(), Some("x/assets/pic.png"));
+        assert_eq!(r("sets/pic.png"), None);
+        i.upsert("a.md", "[[readme]] [[v1.2]]", 0, 0, "t").unwrap();
+        assert_eq!(i.backlinks("README.MD").unwrap().len(), 1);
+        assert_eq!(i.backlinks("v1.2.md").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn folder_filters_are_literal() {
+        let (_d, mut i) = idx();
+        for p in [
+            "my_notes/a.md",
+            "myXnotes/b.md",
+            "my_notes2/e.md",
+            "100%/c.md",
+            "100x/d.md",
+        ] {
+            i.upsert(p, "hello", 1, 1, "t").unwrap();
+        }
+        let paths = |v: Vec<SearchHit>| v.into_iter().map(|h| h.path).collect::<Vec<_>>();
+        assert_eq!(
+            paths(i.search("hello path:my_notes", 10).unwrap()),
+            vec!["my_notes/a.md"]
+        );
+        assert_eq!(
+            paths(i.search("path:my_notes", 10).unwrap()),
+            vec!["my_notes/a.md"]
+        );
+        assert_eq!(
+            paths(i.search("hello path:100%", 10).unwrap()),
+            vec!["100%/c.md"]
+        );
+        let listed: Vec<_> = i
+            .list(Some("my_notes/"), false, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.path)
+            .collect();
+        assert_eq!(listed, vec!["my_notes/a.md"]);
+    }
+
+    #[test]
+    fn rare_tags_survive_the_limit() {
+        let (_d, mut i) = idx();
+        for n in 0..20 {
+            i.upsert(&format!("n{n}.md"), "# word\nword word #common", 1, n, "t")
+                .unwrap();
+        }
+        i.upsert("z/rare.md", "a word #rare #proj/a", 1, 0, "t")
+            .unwrap();
+        i.upsert("z/other.md", "a word #project", 1, 0, "t")
+            .unwrap();
+        let hits = i.search("word tag:rare", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "z/rare.md");
+        assert_eq!(hits[0].tags, vec!["proj/a", "rare"]);
+        assert_eq!(i.search("tag:rare", 1).unwrap()[0].path, "z/rare.md");
+        let proj: Vec<_> = i
+            .search("word tag:proj", 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+        assert_eq!(
+            proj,
+            vec!["z/rare.md"],
+            "nested tags match, prefixes do not"
+        );
+        assert!(i.search("tag:common tag:rare", 10).unwrap().is_empty());
+        assert_eq!(i.search("tag:common", 100).unwrap().len(), 20);
     }
 }
