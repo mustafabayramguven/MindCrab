@@ -7,10 +7,16 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/deps/mindcrab* target/release/mindcrab*
+    && rm -rf src target/release/deps/mindcrab* target/release/mindcrab* \
+              target/release/.fingerprint/mindcrab-*
 COPY src ./src
 COPY web ./web
-RUN cargo build --release --locked && strip target/release/mindcrab
+# COPY keeps the checkout mtimes, which are older than the stub build, so Cargo
+# would treat the crate as fresh and ship the empty stub. Touch to force a rebuild,
+# then fail the build if the binary is not the real one.
+RUN touch src/main.rs \
+    && cargo build --release --locked && strip target/release/mindcrab \
+    && target/release/mindcrab --version | grep -q '^mindcrab '
 
 # ---- runtime ----------------------------------------------------------------
 FROM alpine:3
