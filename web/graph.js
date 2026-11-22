@@ -17,10 +17,15 @@ export class GraphView {
     new ResizeObserver(() => this.resize()).observe(canvas);
   }
 
+  /** Theme colors, re-read only when the theme (class / inline hue on <html>) changes. */
   colors() {
-    const cs = getComputedStyle(document.documentElement);
+    const de = document.documentElement;
+    const sig = de.className + "|" + (de.getAttribute("style") || "");
+    if (this.palette && this.paletteSig === sig) return this.palette;
+    const cs = getComputedStyle(de);
     const v = (n) => cs.getPropertyValue(n).trim();
-    return {
+    this.paletteSig = sig;
+    return this.palette = {
       node: v("--on-surface-variant"),
       current: v("--primary"),
       neighbor: v("--tertiary"),
@@ -31,7 +36,15 @@ export class GraphView {
     };
   }
 
+  /** Re-applies the filters to the last loaded data without fetching it again. */
+  refilter(opts) {
+    if (!this.raw) return false;
+    this.setData(this.raw, opts);
+    return true;
+  }
+
   setData(data, { current, local, orphans }) {
+    this.raw = data;
     this.current = current;
     let nodes = data.nodes;
     let edges = data.edges;
@@ -100,12 +113,18 @@ export class GraphView {
     const a = this.alpha;
     // Repulsion only acts within REACH, so bucket nodes into REACH-sized cells and
     // compare each node with its own and neighbouring cells instead of every node.
-    const REACH = 500, R2 = REACH * REACH;
+    // The push is ~900/d, capped so (nearly) overlapping nodes can't fling each other away.
+    const REACH = 500, R2 = REACH * REACH, MAX_PUSH = 30;
     const push = (p, q) => {
       let dx = q.x - p.x, dy = q.y - p.y;
-      const d2 = dx * dx + dy * dy || 0.01;
+      let d2 = dx * dx + dy * dy;
       if (d2 > R2) return;
-      const f = (900 / d2) * a;
+      if (d2 < 1e-4) { // same spot: separate them in a random direction
+        const t = Math.random() * Math.PI * 2;
+        dx = Math.cos(t); dy = Math.sin(t); d2 = 1;
+      }
+      const d = Math.sqrt(d2);
+      const f = (Math.min(900 / d, MAX_PUSH) / d) * a;
       dx *= f; dy *= f;
       p.vx -= dx; p.vy -= dy;
       q.vx += dx; q.vy += dy;
@@ -176,13 +195,16 @@ export class GraphView {
     const focus = this.hover ?? this.nodes.find((p) => p.id === this.current);
     const fi = focus ? this.nodes.indexOf(focus) : -1;
     ctx.lineWidth = 1 / view.k;
-    for (const [i, j] of this.edges) {
-      const hi = i === fi || j === fi;
+    // Two batched strokes: plain edges, then the focused node's edges on top.
+    for (const hi of [false, true]) {
       ctx.strokeStyle = hi ? c.edgeHi : c.edge;
       ctx.globalAlpha = hi ? 0.9 : 0.7;
       ctx.beginPath();
-      ctx.moveTo(this.nodes[i].x, this.nodes[i].y);
-      ctx.lineTo(this.nodes[j].x, this.nodes[j].y);
+      for (const [i, j] of this.edges) {
+        if ((i === fi || j === fi) !== hi) continue;
+        ctx.moveTo(this.nodes[i].x, this.nodes[i].y);
+        ctx.lineTo(this.nodes[j].x, this.nodes[j].y);
+      }
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
@@ -240,6 +262,7 @@ export class GraphView {
         const [a, b] = [...this.pointers.values()];
         this.pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), k: this.view.k, cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, vx: this.view.x, vy: this.view.y };
         this.dragging = null;
+        if (this.down) this.down.moved = true; // a pinch is never a tap on a node
       }
     });
     cv.addEventListener("pointermove", (e) => {
@@ -252,7 +275,10 @@ export class GraphView {
       this.pointers.set(e.pointerId, p);
       if (this.pinch && this.pointers.size === 2) {
         const [a, b] = [...this.pointers.values()];
-        const k = Math.min(4, Math.max(0.15, (this.pinch.k * Math.hypot(a.x - b.x, a.y - b.y)) / this.pinch.d));
+        const dist = Math.hypot(a.x - b.x, a.y - b.y);
+        // Both fingers went down on the same spot: use the first real distance as the baseline.
+        if (!(this.pinch.d > 0)) { this.pinch.d = dist; return; }
+        const k = Math.min(4, Math.max(0.15, (this.pinch.k * dist) / this.pinch.d));
         this.view.x = this.pinch.cx - ((this.pinch.cx - this.pinch.vx) * k) / this.pinch.k;
         this.view.y = this.pinch.cy - ((this.pinch.cy - this.pinch.vy) * k) / this.pinch.k;
         this.view.k = k;
@@ -271,14 +297,15 @@ export class GraphView {
         this.draw();
       }
     });
-    const up = (e) => {
+    const up = (e, cancelled) => {
       this.pointers.delete(e.pointerId);
       if (this.pointers.size < 2) this.pinch = null;
-      if (this.down && !this.down.moved && this.down.hit && this.pointers.size === 0) this.onOpen(this.down.hit.id);
+      // Only a real tap opens a note; a cancelled pointer (browser took over) never does.
+      if (!cancelled && this.down && !this.down.moved && this.down.hit && this.pointers.size === 0) this.onOpen(this.down.hit.id);
       if (this.pointers.size === 0) { this.down = null; this.dragging = null; }
     };
-    cv.addEventListener("pointerup", up);
-    cv.addEventListener("pointercancel", up);
+    cv.addEventListener("pointerup", (e) => up(e, false));
+    cv.addEventListener("pointercancel", (e) => up(e, true));
     cv.addEventListener("wheel", (e) => {
       e.preventDefault();
       this.fitted = true;

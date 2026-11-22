@@ -256,7 +256,10 @@ function setMode(mode) {
 function showView(name) {
   S.view = name;
   $("#app").dataset.view = name;
-  if (name !== "canvas" && S.canvas) { S.canvas.destroy(); S.canvas = null; S.canvasPath = null; }
+  // Any navigation ends the current canvas editor, canvas → canvas included:
+  // showCanvas() builds a fresh one, and a stale one must never handle events or save.
+  if (S.canvas) { S.canvas.destroy(); S.canvas = null; }
+  if (name !== "canvas") S.canvasPath = null;
   if (name !== "page") S.page = null;
   for (const v of ["note", "list", "graph", "empty", "page", "canvas"]) $(`#${v}-view`).hidden = v !== name;
   $$(".nav-list .nav-item").forEach((a) => a.classList.toggle("on", name === "page" && a.dataset.nav === S.page));
@@ -685,6 +688,7 @@ async function newCanvas(folder = "") {
 }
 
 async function showCanvas(path) {
+  if (S.canvas) { S.canvas.destroy(); S.canvas = null; } // before anything async
   if (S.dirty) await save();
   showView("canvas");
   S.canvasPath = path;
@@ -697,8 +701,10 @@ async function showCanvas(path) {
   if (isMobile()) setDrawer(false);
   const { CanvasEditor } = await import("/canvas.js");
   if (S.canvasPath !== path) return; // navigated away while loading
-  S.canvas = new CanvasEditor($("#canvas-view"), path, { api, I, t, esc, go, fail, dialogPrompt, enhance });
-  try { await S.canvas.load(); } catch (e) { fail(e); }
+  S.canvas?.destroy(); // a concurrent showCanvas() of the same path may have built one
+  const editor = new CanvasEditor($("#canvas-view"), path, { api, I, t, esc, go, fail, dialogPrompt, enhance });
+  S.canvas = editor;
+  try { await editor.load(); } catch (e) { fail(e); }
 }
 
 async function renameFolder(folder) {
@@ -1141,8 +1147,13 @@ async function showGraph() {
   S.graph.setData(data, { current: store.get("last", null), local: $("#graph-local").checked, orphans: $("#graph-orphans").checked });
   if (isMobile()) setDrawer(false);
 }
-$("#graph-local").addEventListener("change", showGraph);
-$("#graph-orphans").addEventListener("change", showGraph);
+// Filters re-shape the already loaded graph instead of fetching /api/graph again.
+const filterGraph = () => {
+  const opts = { current: store.get("last", null), local: $("#graph-local").checked, orphans: $("#graph-orphans").checked };
+  if (!S.graph?.refilter(opts)) showGraph();
+};
+$("#graph-local").addEventListener("change", filterGraph);
+$("#graph-orphans").addEventListener("change", filterGraph);
 
 // ------------------------------------------------------------------ settings
 function renderSettings() {
