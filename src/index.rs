@@ -319,6 +319,131 @@ impl Index {
             .optional()?)
     }
 
+    /// (size, mtime) of every indexed note, so a rescan can spot changes with one query.
+    pub fn all_note_states(&self) -> Result<HashMap<String, (i64, i64)>> {
+        let mut st = self.conn.prepare("SELECT path, size, mtime FROM notes")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// (size, mtime) of every indexed attachment.
+    pub fn all_file_states(&self) -> Result<HashMap<String, (i64, i64)>> {
+        let mut st = self.conn.prepare("SELECT path, size, mtime FROM files")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)?, r.get::<_, i64>(2)?),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Applies attachment changes found by a rescan in one transaction: `upsert` holds
+    /// (path, size, mtime) of new or changed files, `remove` the paths that are gone.
+    pub fn apply_file_changes(
+        &mut self,
+        upsert: &[(String, i64, i64)],
+        remove: &[String],
+    ) -> Result<()> {
+        if upsert.is_empty() && remove.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        let mut new_paths = false;
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO files(path,name,size,mtime) VALUES(?1,?2,?3,?4)",
+            )?;
+            let mut upd = tx.prepare_cached("UPDATE files SET size=?2, mtime=?3 WHERE path=?1")?;
+            for (path, size, mtime) in upsert {
+                let name = path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .to_lowercase();
+                if ins.execute(params![path, name, size, mtime])? > 0 {
+                    new_paths = true;
+                } else {
+                    upd.execute(params![path, size, mtime])?;
+                }
+            }
+            let mut del = tx.prepare_cached("DELETE FROM files WHERE path=?1")?;
+            for p in remove {
+                new_paths |= del.execute([p])? > 0;
+            }
+        }
+        tx.commit()?;
+        if new_paths {
+            self.paths_gen.set(self.paths_gen.get() + 1);
+        }
+        Ok(())
+    }
+
+    /// Moves a note's rows to `p.path` without losing its embedding vectors (indexing it
+    /// afresh under the new name would re-embed the whole note). Title, links, tags, tasks
+    /// and search text are rebuilt for the new path; history moves with [`Index::rename`].
+    pub fn move_note(&mut self, from: &str, p: &Prepared, source: &str) -> Result<()> {
+        let to = p.path.as_str();
+        let tx = self.conn.transaction()?;
+        // A leftover row for the target (its file is gone) would block the move.
+        tx.execute("DELETE FROM notes_fts WHERE path=?1", [to])?;
+        tx.execute("DELETE FROM notes WHERE path=?1", [to])?;
+        tx.execute(
+            "INSERT INTO notes(path,title,hash,size,mtime,frontmatter,content,private)
+             SELECT ?2,title,hash,size,mtime,frontmatter,content,private FROM notes WHERE path=?1",
+            params![from, to],
+        )?;
+        tx.execute("UPDATE chunks SET path=?2 WHERE path=?1", params![from, to])?;
+        tx.execute("DELETE FROM notes_fts WHERE path=?1", [from])?;
+        tx.execute("DELETE FROM notes WHERE path=?1", [from])?;
+        // Forced so everything derived from the path is rebuilt; chunks whose text did not
+        // change keep their vectors.
+        Self::apply(&tx, p, source, true)?;
+        tx.commit()?;
+        self.after_apply(true, true);
+        Ok(())
+    }
+
+    /// Notes that carry every tag in `tags`, where a tag also covers its nested tags
+    /// (`a` matches `a/b`) — the same rule as the `tag:` search filter.
+    pub fn paths_with_tags(&self, tags: &[String]) -> Result<HashSet<String>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT DISTINCT path FROM tags WHERE tag = ?1 OR (tag >= ?1 || '/' AND tag < ?1 || '0')",
+        )?;
+        let mut out: Option<HashSet<String>> = None;
+        for t in tags {
+            let found = st
+                .query_map([t], |r| r.get::<_, String>(0))?
+                .collect::<Result<HashSet<_>, _>>()?;
+            out = Some(match out {
+                None => found,
+                Some(mut prev) => {
+                    prev.retain(|p| found.contains(p));
+                    prev
+                }
+            });
+        }
+        Ok(out.unwrap_or_default())
+    }
+
+    /// Paths of notes whose indexed text passes `keep` (one pass over all notes).
+    pub fn note_paths_where(&self, mut keep: impl FnMut(&str) -> bool) -> Result<Vec<String>> {
+        let mut st = self.conn.prepare("SELECT path, content FROM notes")?;
+        let mut rows = st.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            if keep(r.get_ref(1)?.as_str()?) {
+                out.push(r.get(0)?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Indexes a note. If an older version exists with a different hash, it is
     /// kept as a revision attributed to `source`. Returns true if anything changed.
     pub fn upsert(
