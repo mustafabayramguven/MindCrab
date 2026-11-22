@@ -24,6 +24,11 @@ const drafts = {
   get: (p) => store.get(drafts.key(p), null),
   put: (p, content, base) => store.set(drafts.key(p), { content, base, t: Date.now() }),
   clear: (p) => store.del(drafts.key(p)),
+  // Paths of every note with a draft on this device.
+  paths: () => {
+    const pre = "mc." + drafts.key("");
+    try { return Object.keys(localStorage).filter((k) => k.startsWith(pre)).map((k) => k.slice(pre.length)); } catch { return []; }
+  },
 };
 
 // ------------------------------------------------------------------ icons
@@ -56,14 +61,19 @@ async function api(method, url, body, opts = {}) {
     if (opts.raw) init.body = body;
     else { init.body = JSON.stringify(body); init.headers["content-type"] = "application/json"; }
   }
+  // Lets a save outlive the page; browsers cap keepalive bodies at 64 KB, bigger ones go normally.
+  if (opts.keepalive && typeof init.body === "string" && new Blob([init.body]).size < 60000) init.keepalive = true;
   let res;
   try { res = await fetch(url, init); } catch (e) { setOffline(true); throw new ApiError(0, e.message); }
-  if (res.status === 401 && !opts.noAuthRedirect) { showLogin(); throw new ApiError(401, "login required"); }
-  if (res.status === 304 && memo) { if (S.offline) setOffline(!navigator.onLine); return memo.data; }
+  // The service worker marks answers it served from its offline copy: the server was not reached.
+  const live = !res.headers.has("x-mc-cache");
+  const reached = () => { if (!live) setOffline(true); else if (S.offline) setOffline(!navigator.onLine); };
+  if (res.status === 401 && !opts.noAuthRedirect) { signedOut(); throw new ApiError(401, "login required"); }
+  if (res.status === 304 && memo) { reached(); return memo.data; }
   const data = res.headers.get("content-type")?.includes("json") ? await res.json() : await res.text();
   if (res.status === 503 && data?.offline) { setOffline(true); throw new ApiError(0, "offline"); }
   if (!res.ok) throw new ApiError(res.status, data?.error || res.statusText);
-  if (S.offline && method === "GET" && res.headers.get("date")) setOffline(!navigator.onLine);
+  if (method === "GET") reached();
   const tag = conditional && res.headers.get("etag");
   if (tag) {
     etags.delete(url);
@@ -157,7 +167,7 @@ function setOffline(v) {
   if (S.offline === v) return;
   S.offline = v;
   $("#offline-banner").hidden = !v;
-  if (!v && S.dirty) save();
+  if (!v) { if (S.dirty) save(); syncDrafts(); }
 }
 addEventListener("online", () => { setOffline(false); poll(); });
 addEventListener("offline", () => setOffline(true));
@@ -290,8 +300,13 @@ function showView(name) {
   if (!noteOnly) { $("#crumbs").textContent = ""; }
 }
 
-function showPage(name, title) {
-  if (S.dirty) save();
+async function showPage(name, title) {
+  // Leave the note only once its save finished; a note still loading must not take over.
+  const seq = ++openSeq;
+  flushDraft();
+  if (S.dirty) await save({ leaving: true });
+  while (S.saving) await S.saving;
+  if (seq !== openSeq) return;
   S.page = name;
   showView("page");
   S.page = name;
@@ -316,7 +331,9 @@ async function loadTree() {
   const pb = $("#pending-badge");
   pb.hidden = !data.pending;
   pb.textContent = data.pending || "";
-  renderTree();
+  // Every save changes an mtime; rebuild the tree only when something it shows changed.
+  const sig = JSON.stringify([S.notes.map((n) => [n.path, n.title]), S.folders, S.canvases, data.hidden || []]);
+  if (sig !== S.treeSig) { S.treeSig = sig; renderTree(); }
   return data;
 }
 
@@ -343,7 +360,9 @@ const coll = new Intl.Collator(LANG, { numeric: true, sensitivity: "base" });
 function renderTree() {
   const root = buildTree();
   const ul = $("#tree");
-  ul.innerHTML = "";
+  const scroller = ul.closest(".drawer-scroll");
+  const top = scroller?.scrollTop;
+  const frag = document.createDocumentFragment();
   const walk = (node, parent) => {
     const folders = [...node.folders.values()].sort((a, b) => coll.compare(a.name, b.name));
     for (const f of folders) {
@@ -365,13 +384,16 @@ function renderTree() {
       parent.append(li);
     }
   };
-  walk(root, ul);
+  walk(root, frag);
+  ul.replaceChildren(frag);
+  if (scroller) scroller.scrollTop = top; // a rebuild keeps the drawer where the user left it
 }
 
-function highlightTree() {
+// `reveal` (on navigation) also expands the open note's folders and scrolls it into view.
+function highlightTree(reveal = true) {
   $$("#tree .tree-row[data-note]").forEach((r) => r.classList.toggle("on", r.dataset.note === S.path));
   // expand parents of the current note
-  if (S.path) {
+  if (reveal && S.path) {
     let d = dirOf(S.path), changed = false;
     while (d) { if (S.collapsed.delete(d)) changed = true; d = dirOf(d); }
     if (changed) { store.set("collapsed", [...S.collapsed]); renderTree(); }
@@ -389,9 +411,12 @@ $("#tree").addEventListener("click", (e) => {
   }
   if (row.dataset.folder !== undefined) {
     const f = row.dataset.folder;
-    S.collapsed.has(f) ? S.collapsed.delete(f) : S.collapsed.add(f);
+    const closed = !S.collapsed.has(f);
+    closed ? S.collapsed.add(f) : S.collapsed.delete(f);
     store.set("collapsed", [...S.collapsed]);
-    renderTree();
+    // Toggle in place (keeps focus and scroll) instead of rebuilding the whole tree.
+    row.parentElement.classList.toggle("collapsed", closed);
+    row.querySelector("i:not(.chev)").outerHTML = I(closed ? "folder" : "folder_open");
   } else {
     go(row.dataset.note);
   }
@@ -466,15 +491,29 @@ function linkName(path) {
   return same.length > 1 ? path.replace(/\.md$/i, "") : s;
 }
 
-async function openNote(path, { keepScroll = false } = {}) {
-  if (S.dirty && S.path && S.path !== path) await save();
-  let note;
-  try {
-    note = await api("GET", "/api/note?path=" + encodeURIComponent(path));
-  } catch (e) {
-    if (e.status === 404) { toast(e.message); showView("empty"); S.path = null; highlightTree(); return; }
-    throw e;
+// Bumped by every navigation: only the latest one may fill the editor or switch the view.
+let openSeq = 0, opening = null;
+async function openNote(path, { keepScroll = false, note = null } = {}) {
+  const seq = ++openSeq;
+  opening = path;
+  flushDraft();
+  if (S.dirty && S.path && S.path !== path) await save({ leaving: true });
+  while (S.saving) await S.saving; // reading the note mid-save could return the old text
+  const upload = syncing.get(path);
+  if (upload) await upload; // a background draft upload for this note lands first
+  if (seq !== openSeq) return;
+  if (!note) {
+    try {
+      note = await api("GET", "/api/note?path=" + encodeURIComponent(path));
+    } catch (e) {
+      if (seq !== openSeq) return;
+      opening = null;
+      if (e.status === 404) { toast(e.message); showView("empty"); S.path = null; highlightTree(); return; }
+      throw e;
+    }
+    if (seq !== openSeq) return;
   }
+  opening = null; // from here on S.path names it
   const ed = $("#editor");
   const scroll = keepScroll ? [ed.scrollTop, ed.selectionStart] : null;
   S.path = note.path;
@@ -492,6 +531,7 @@ async function openNote(path, { keepScroll = false } = {}) {
   if (draft && draft.content !== note.content) {
     let use = draft.base === note.hash;
     if (!use) use = !!(await dialogPrompt({ title: t("draft.title"), text: t("draft.body"), input: false, ok: t("draft.use") }));
+    if (seq !== openSeq) return;
     if (use && S.path === note.path) {
       ed.value = draft.content;
       onEdit();
@@ -521,50 +561,92 @@ function setSaveState(s) {
   el.title = t(key);
 }
 
-let draftTimer;
+// Unsaved text goes to a local draft shortly after typing stops. The pending write is bound to
+// the note it was scheduled for, and navigation flushes it before the editor shows another note.
+let draftJob = null;
+function scheduleDraft() {
+  cancelDraft();
+  if (!S.path || !S.note) return;
+  const job = { path: S.path, note: S.note };
+  job.timer = setTimeout(() => runDraft(job), 400);
+  draftJob = job;
+}
+function cancelDraft() {
+  if (draftJob) clearTimeout(draftJob.timer);
+  draftJob = null;
+}
+function runDraft(job) {
+  if (draftJob === job) cancelDraft();
+  if (S.note !== job.note || S.path !== job.path) return;
+  const text = $("#editor").value;
+  if (text !== S.content) drafts.put(job.path, text, job.note.hash);
+  else drafts.clear(job.path);
+}
+const flushDraft = () => { if (draftJob) runDraft(draftJob); };
+
 function onEdit() {
   S.dirty = $("#editor").value !== S.content;
-  clearTimeout(draftTimer);
-  if (S.path && S.note) {
-    const path = S.path, base = S.note.hash;
-    draftTimer = setTimeout(() => (S.dirty ? drafts.put(path, $("#editor").value, base) : drafts.clear(path)), 400);
-  }
+  scheduleDraft();
   setSaveState(S.dirty ? "dirty" : "saved");
   clearTimeout(S.saveTimer);
   if (S.dirty) S.saveTimer = setTimeout(save, 900);
   if (S.mode === "split") renderPreview();
 }
 
-async function save({ force = false } = {}) {
+// One save at a time: another one started meanwhile would send a stale expected hash.
+// `leaving`: the caller navigates away next, so a conflict settled by "reload" just drops the edit.
+async function save({ force = false, keepalive = false, leaving = false } = {}) {
   clearTimeout(S.saveTimer);
-  if (!S.path || (!S.dirty && !force)) return;
-  if (S.saving) { await S.saving; if (!S.dirty) return; }
-  const path = S.path;
-  const content = $("#editor").value;
+  while (S.saving) await S.saving;
+  if (!S.path || !S.note || (!S.dirty && !force)) return;
+  let release, reload = null;
+  S.saving = new Promise((r) => (release = r));
+  try { reload = await put(S.note, S.path, $("#editor").value, force, keepalive); }
+  catch (e) { fail(e); }
+  finally { S.saving = null; release(); }
+  // Reopening the note waits for S.saving, so it can only run once the lock is released.
+  if (reload && !leaving) await reloadAfterConflict(reload);
+}
+
+// Writes `content` for `note` (captured when the save started, so navigating meanwhile is safe).
+// Resolves to { path, local } when a conflict was settled by keeping the server version, else null.
+async function put(note, path, content, force, keepalive) {
+  const started = Date.now();
   setSaveState("saving");
-  S.saving = (async () => {
-    try {
-      const r = await api("PUT", "/api/note", { path, content, expected_hash: force ? null : S.note.hash });
-      if (S.path !== path) return;
-      S.note.hash = r.hash;
-      S.content = content;
-      S.dirty = $("#editor").value !== content;
-      const d = drafts.get(path);
-      if (!S.dirty || (d && d.content === content)) { clearTimeout(draftTimer); drafts.clear(path); }
-      setOffline(false);
+  try {
+    const r = await api("PUT", "/api/note", { path, content, expected_hash: force ? null : note.hash }, { keepalive });
+    note.hash = r.hash;
+    const open = S.note === note;
+    if (open) { S.content = content; S.dirty = $("#editor").value !== content; }
+    // The server has `content` now: a draft that is not newer than that is obsolete.
+    const d = drafts.get(path);
+    if (open && !S.dirty) { cancelDraft(); drafts.clear(path); }
+    else if (d && (d.content === content || d.t < started)) drafts.clear(path);
+    setOffline(false);
+    if (open) {
       setSaveState(S.dirty ? "dirty" : "saved");
       if (S.dirty) S.saveTimer = setTimeout(save, 900);
-      refreshMeta();
-    } catch (e) {
-      if (e.status === 409) return conflict();
-      if (e.status === 0) { setSaveState("offline"); drafts.put(path, content, S.note.hash); S.saveTimer = setTimeout(save, 15000); return; }
-      setSaveState("error");
-      fail(e);
-    } finally {
-      S.saving = null;
     }
-  })();
-  return S.saving;
+    refreshMeta();
+  } catch (e) {
+    const open = S.note === note;
+    if (e.status === 409 && open) return conflict(note, path);
+    if (e.status === 0 || e.status === 409) {
+      // Keep the text on this device: synced once back online, or settled when the note is opened.
+      if (open) {
+        drafts.put(path, $("#editor").value, note.hash);
+        setSaveState("offline");
+        S.saveTimer = setTimeout(save, 15000);
+      } else {
+        const d = drafts.get(path);
+        if (!d || d.t < started) drafts.put(path, content, note.hash);
+      }
+      return null;
+    }
+    if (open) setSaveState("error");
+    fail(e);
+  }
+  return null;
 }
 
 let metaTimer;
@@ -572,21 +654,55 @@ function refreshMeta() {
   clearTimeout(metaTimer);
   metaTimer = setTimeout(async () => {
     await Promise.all([loadTree(), loadTags()]).catch(() => {});
-    highlightTree();
+    highlightTree(false); // a save must not re-expand folders the user collapsed
     if (panelOpen()) loadPanel();
   }, 1200);
 }
 
-async function conflict() {
+// Runs inside save()'s lock, so "Overwrite" writes through put() directly instead of save().
+async function conflict(note, path) {
   setSaveState("error");
-  const d = $("#prompt-dialog");
-  const choice = await dialogPrompt({ title: t("conflict.title"), text: t("conflict.body"), input: false, ok: t("action.overwrite"), danger: true });
-  if (choice) return save({ force: true });
-  // reload server version (local text goes to clipboard-free fallback: keep in history via overwrite only)
-  d.close();
+  const overwrite = await dialogPrompt({ title: t("conflict.title"), text: t("conflict.body"), input: false, ok: t("action.overwrite"), danger: true });
+  if (S.note !== note) return null;
+  if (overwrite) return put(note, path, $("#editor").value, true, false);
+  // Keep the server version; the local text stays one "Undo" away.
   const local = $("#editor").value;
-  await openNote(S.path, { keepScroll: true });
-  toast(t("action.reload"), { label: t("action.undo"), run: () => { $("#editor").value = local; onEdit(); } });
+  cancelDraft();
+  drafts.clear(path);
+  clearTimeout(S.saveTimer);
+  S.dirty = false; // saves queued meanwhile (e.g. on blur) must not run into the same conflict
+  return { path, local };
+}
+async function reloadAfterConflict({ path, local }) {
+  try { await openNote(path, { keepScroll: true }); } catch (e) { return fail(e); }
+  if (S.path !== path) return;
+  toast(t("action.reload"), { label: t("action.undo"), run: () => { if (S.path === path) { $("#editor").value = local; onEdit(); } } });
+}
+
+// Drafts of other notes edited offline are uploaded once the server is reachable again. Each one
+// only applies on top of the version it was based on: if the note changed on the server meanwhile,
+// the draft stays and opening the note asks which text to keep.
+const syncing = new Map();
+let draftSync = null;
+function syncDrafts() {
+  draftSync ??= (async () => {
+    let synced = false;
+    for (const path of drafts.paths()) {
+      if (S.offline) break;
+      const d = drafts.get(path);
+      // The open note (or one being opened) is saved by save().
+      if (path === S.path || path === opening || !d?.base || typeof d.content !== "string") continue;
+      const job = api("PUT", "/api/note", { path, content: d.content, expected_hash: d.base }).then(
+        () => { if (drafts.get(path)?.t === d.t) drafts.clear(path); synced = true; return true; },
+        (e) => e.status !== 0 && e.status !== 401, // stop when offline or signed out; skip conflicts
+      );
+      syncing.set(path, job);
+      const more = await job;
+      syncing.delete(path);
+      if (!more) break;
+    }
+    if (synced) refreshMeta();
+  })().finally(() => { draftSync = null; });
 }
 
 let previewTimer, previewSeq = 0;
@@ -1356,8 +1472,12 @@ $("#offline-clear").addEventListener("click", async () => {
 });
 
 $("#logout").addEventListener("click", async () => {
-  await api("POST", "/api/logout", {});
-  if ("caches" in window) await caches.delete("mc-data").catch(() => {});
+  if (S.dirty) await save();
+  // Clear before the request (which fails offline, or may hang) and again after it, in case
+  // something was cached in between.
+  await forgetLocal();
+  try { await api("POST", "/api/logout", {}, { noAuthRedirect: true }); } catch {}
+  await forgetLocal();
   location.reload();
 });
 
@@ -1411,20 +1531,29 @@ async function poll() {
   if (document.hidden || $("#app").hidden) return;
   try {
     const before = S.notes.find((n) => n.path === S.path)?.mtime;
-    await loadTree();
-    loadTags();
-    highlightTree();
+    await loadTree(); // marks the open note itself; no folder expanding or scrolling from a poll
+    loadTags().catch(() => {});
     views.refreshTaskBadge();
     const now = S.notes.find((n) => n.path === S.path);
-    if (S.view === "note" && S.path && !S.dirty && !S.saving && now && now.mtime !== before && document.activeElement !== ed) {
-      const fresh = await api("GET", "/api/note?path=" + encodeURIComponent(S.path));
-      if (fresh.hash !== S.note.hash && !S.dirty) { await openNote(S.path, { keepScroll: true }); }
+    if (S.view === "note" && S.path && !S.dirty && !S.saving && now && now.mtime !== before && document.activeElement !== ed && !$("dialog[open]")) {
+      const path = S.path, note = S.note;
+      const fresh = await api("GET", "/api/note?path=" + encodeURIComponent(path));
+      // Hand this answer to openNote rather than fetching the note a second time.
+      if (S.note === note && !S.dirty && !S.saving && fresh.hash !== note.hash) await openNote(path, { keepScroll: true, note: fresh });
     }
   } catch {}
 }
 setInterval(poll, 20000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); else if (S.dirty) save(); });
-addEventListener("beforeunload", (e) => { if (S.dirty) { save(); e.preventDefault(); } });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) return poll();
+  flushDraft();
+  if (S.dirty) save({ keepalive: true });
+});
+addEventListener("beforeunload", (e) => {
+  // Nothing asynchronous survives unloading: write the draft now and let the last save outlive the page.
+  flushDraft();
+  if (S.dirty) { save({ keepalive: true }); e.preventDefault(); }
+});
 
 // ------------------------------------------------------------------ wiring
 $("#toggle-drawer").onclick = () => setDrawer($("#app").classList.contains("drawer-closed"));
@@ -1791,6 +1920,22 @@ function showLogin() {
   $("#login").hidden = false;
   $("#login-token").focus();
 }
+
+// What this device keeps from the vault: offline copies, unsaved drafts and a pending share.
+async function forgetLocal({ keepShare = false } = {}) {
+  cancelDraft();
+  clearTimeout(S.saveTimer);
+  S.dirty = false;
+  drafts.paths().forEach(drafts.clear);
+  try { navigator.serviceWorker?.controller?.postMessage("clear-data"); } catch {}
+  if ("caches" in window) await Promise.all(["mc-data", ...(keepShare ? [] : ["mc-share"])].map((k) => caches.delete(k).catch(() => {})));
+}
+// The login is gone (token changed, cookie removed). A share received meanwhile is not vault
+// data and is kept, so it can still be saved after signing in again.
+function signedOut() {
+  forgetLocal({ keepShare: true });
+  showLogin();
+}
 $("#login-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   $("#login-error").hidden = true;
@@ -1805,18 +1950,29 @@ $("#login-form").addEventListener("submit", async (e) => {
 });
 
 async function boot() {
-  try { S.settings = (await api("GET", "/api/session", undefined, { noAuthRedirect: true })).settings; }
-  catch (e) { if (e.status === 401) return showLogin(); return toast(e.message); }
+  // The session always comes from the server (the service worker never caches it).
+  let session = null;
+  try { session = await api("GET", "/api/session", undefined, { noAuthRedirect: true }); }
+  catch (e) {
+    if (e.status === 401) { signedOut(); return; }
+    fail(e); // offline or the server is down: carry on with what this device kept
+  }
+  if (session) store.set("settings", session.settings);
+  S.settings = session ? session.settings : store.get("settings", undefined);
+  const [tree] = await Promise.allSettled([loadTree(), loadTags(), api("GET", "/api/embed-status").then((st) => (S.semantic = st.enabled))]);
+  // Neither the server nor kept copies (none yet, or cleared at sign-out): nothing to show but the login.
+  if (tree.status === "rejected" && !session) return showLogin();
   $("#login").hidden = true;
   $("#app").hidden = false;
   setDrawer(isMobile() ? false : store.get("drawer", true));
   setPanel(isMobile() ? false : store.get("panel", true));
   setMode(S.mode);
   $("#offline-banner").hidden = !S.offline;
-  await Promise.all([loadTree(), loadTags(), api("GET", "/api/embed-status").then((st) => (S.semantic = st.enabled)).catch(() => {})]);
+  if (tree.status === "rejected") fail(tree.reason);
   route();
   views.refreshTaskBadge();
   if ("serviceWorker" in navigator && isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
+  if (session) syncDrafts();
 }
 
 applyI18n();
