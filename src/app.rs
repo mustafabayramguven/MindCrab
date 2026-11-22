@@ -9,9 +9,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 /// Semantic hits must score at least this fraction of the best hit.
 const RELATIVE_CUTOFF: f32 = 0.8;
@@ -183,47 +183,89 @@ impl App {
 
     /// `force` re-reads every file even when size and mtime are unchanged.
     pub fn sync(&self, force: bool) -> Result<(usize, usize)> {
-        let _w = self.wlock();
+        // Walking the disk and reading changed notes needs no write lock (a rescan of a big
+        // vault would otherwise stall every writer); results are re-checked under the lock.
         let (notes, files, dirs) = self.vault.scan();
-        let idx = self.idx();
-        let force = force || idx.needs_reindex;
-        let chunking = idx.chunking;
-        let on_disk: std::collections::HashSet<&str> =
-            notes.iter().map(|e| e.rel.as_str()).collect();
-        let mut todo = Vec::new();
-        for e in &notes {
-            let state = idx.note_state(&e.rel)?;
-            if force || !matches!(state, Some((_, s, m)) if s == e.size as i64 && m == e.mtime) {
-                todo.push(e);
-            }
-        }
-        // Reading and parsing is the slow part and needs no database: do it in parallel
-        // (the write lock keeps other writers out meanwhile), then store in batches.
-        drop(idx);
+        let (note_states, file_states, force, chunking) = {
+            let idx = self.idx();
+            (
+                idx.all_note_states()?,
+                idx.all_file_states()?,
+                force || idx.needs_reindex,
+                idx.chunking,
+            )
+        };
+        let todo: Vec<&vault::Entry> = notes
+            .iter()
+            .filter(|e| force || note_states.get(&e.rel) != Some(&(e.size as i64, e.mtime)))
+            .collect();
+        // Reading and parsing is the slow part and needs no database: do it in parallel,
+        // then store in batches.
         let mut changed = 0;
         for batch in todo.chunks(512) {
-            let prepared = self.prepare_parallel(batch, chunking);
+            let mut prepared = self.prepare_parallel(batch, chunking);
+            let _w = self.wlock();
+            // A writer may have replaced a file after it was read: read it again.
+            prepared.retain_mut(|p| match self.vault.meta(&p.path) {
+                Some(m) if m.size as i64 == p.size && m.mtime == p.mtime => true,
+                Some(m) => match self.vault.read(&p.path) {
+                    Ok(c) => {
+                        let path = std::mem::take(&mut p.path);
+                        *p = index::prepare(&path, c, m.size as i64, m.mtime, chunking);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                None => false,
+            });
             changed += self.idx().upsert_many(&prepared, "external")?;
         }
+
+        let _w = self.wlock();
         let mut idx = self.idx();
+        // Stale entries: indexed, not seen by the walk and still missing now (a writer may
+        // have created the file after the walk).
+        let on_disk: HashSet<&str> = notes.iter().map(|e| e.rel.as_str()).collect();
         let mut removed = 0;
-        for p in idx.all_paths()? {
-            if !on_disk.contains(p.as_str()) {
-                idx.remove(&p, "external")?;
+        for p in note_states.keys() {
+            if !on_disk.contains(p.as_str())
+                && !self.vault.exists(p)
+                && idx.note_state(p)?.is_some()
+            {
+                idx.remove(p, "external")?;
                 removed += 1;
             }
         }
-        let files_on_disk: std::collections::HashSet<&str> =
-            files.iter().map(|e| e.rel.as_str()).collect();
-        for p in idx.all_file_paths()? {
-            if !files_on_disk.contains(p.as_str()) {
-                idx.remove_file(&p)?;
-            }
+        let files_on_disk: HashSet<&str> = files.iter().map(|e| e.rel.as_str()).collect();
+        let gone: Vec<String> = file_states
+            .keys()
+            .filter(|p| !files_on_disk.contains(p.as_str()) && !self.vault.exists(p))
+            .cloned()
+            .collect();
+        // New or changed attachments, with fresh metadata in case one was replaced meanwhile.
+        let fresh: Vec<(String, i64, i64)> = files
+            .iter()
+            .filter(|f| file_states.get(&f.rel) != Some(&(f.size as i64, f.mtime)))
+            .filter_map(|f| self.vault.meta(&f.rel))
+            .map(|m| (m.rel, m.size as i64, m.mtime))
+            .collect();
+        idx.apply_file_changes(&fresh, &gone)?;
+        // The folder table is only rewritten when the set of folders changed.
+        let folders = idx.folders()?;
+        let indexed: HashSet<&str> = folders.iter().map(String::as_str).collect();
+        let walked: HashSet<&str> = dirs.iter().map(String::as_str).collect();
+        if indexed != walked {
+            let is_dir =
+                |d: &str| std::fs::symlink_metadata(self.vault.abs(d)).is_ok_and(|m| m.is_dir());
+            // Keep folders created after the walk, drop only those that are really gone.
+            let keep: Vec<String> = dirs
+                .iter()
+                .chain(folders.iter().filter(|d| !walked.contains(d.as_str())))
+                .filter(|d| is_dir(d))
+                .cloned()
+                .collect();
+            idx.set_folders(&keep)?;
         }
-        for f in &files {
-            idx.upsert_file(&f.rel, f.size as i64, f.mtime)?;
-        }
-        idx.set_folders(&dirs)?;
         if idx.needs_reindex {
             idx.mark_reindexed()?;
         }
@@ -579,86 +621,109 @@ impl App {
             return Ok((to, 0));
         }
         let _w = self.wlock();
-        if !self.vault.exists(&from) {
+        self.rename_note_locked(&from, &to, source, &HashMap::new())
+    }
+
+    /// [`Self::rename_note`] with the write lock held. `moved` maps old to new paths of
+    /// everything else that moves along (a folder move), so the note's relative links
+    /// can point at where their targets end up.
+    fn rename_note_locked(
+        &self,
+        from: &str,
+        to: &str,
+        source: &str,
+        moved: &HashMap<String, String>,
+    ) -> AResult<(String, usize)> {
+        if !self.vault.exists(from) {
             return Err(AppError::NotFound(format!("note not found: {from}")));
         }
-        if self.vault.exists(&to) && from.to_lowercase() != to.to_lowercase() {
+        if self.vault.exists(to) && from.to_lowercase() != to.to_lowercase() {
             return Err(AppError::Conflict(format!("{to} already exists")));
         }
-        // Collect (src, raw) link texts that currently resolve to `from`.
+        // Collect (src, raw) link texts that currently resolve to `from`, including the
+        // note's links to itself (which backlinks leave out).
         let referrers: Vec<(String, Vec<String>)> = {
             let idx = self.idx();
+            let mut srcs: Vec<String> = idx.backlinks(from)?.into_iter().map(|b| b.path).collect();
+            srcs.push(from.to_string());
             let mut out = Vec::new();
-            for b in idx.backlinks(&from)? {
+            for src in srcs {
                 let raws: Vec<String> = idx
-                    .outgoing(&b.path)?
+                    .outgoing(&src)?
                     .into_iter()
-                    .filter(|l| l.path.as_deref() == Some(from.as_str()))
+                    .filter(|l| l.path.as_deref() == Some(from))
                     .map(|l| l.target)
                     .collect();
-                out.push((b.path, raws));
+                if !raws.is_empty() {
+                    out.push((src, raws));
+                }
             }
             out
         };
-        let content = self.vault.read(&from)?;
+        let content = self.vault.read(from)?;
         if from.to_lowercase() == to.to_lowercase() {
             // Case-only rename: go through a temp name for case-insensitive filesystems.
             let tmp = format!("{from}.mc-rename");
-            self.vault.rename(&from, &tmp)?;
-            self.vault.rename(&tmp, &to)?;
+            self.vault.rename(from, &tmp)?;
+            self.vault.rename(&tmp, to)?;
         } else {
-            self.vault.rename(&from, &to)?;
+            self.vault.rename(from, to)?;
         }
+        let m = self.vault.meta(to).context("stat after rename")?;
         {
+            // Move the index rows rather than re-index: keeps the embedding vectors.
             let mut idx = self.idx();
-            idx.remove(&from, &format!("{source} (renamed to {to})"))?;
-            idx.rename(&from, &to)?;
+            let p = index::prepare(to, content.clone(), m.size as i64, m.mtime, idx.chunking);
+            idx.move_note(from, &p, source)?;
+            idx.rename(from, to)?;
+            if let Some((dir, _)) = to.rsplit_once('/') {
+                idx.add_folder(dir)?;
+            }
+            idx.log_activity(source, "move", to, None, Some(from))?;
         }
-        self.persist_opts(&to, &content, source, false)?;
-        self.idx()
-            .log_activity(source, "move", &to, None, Some(&from))?;
+        self.wake();
 
-        let new_stem = note::stem(&to).to_string();
-        let stem_unique = self.idx().resolve_link("", &new_stem)?.as_deref() == Some(to.as_str());
+        let new_stem = note::stem(to).to_string();
+        let stem_unique = self.idx().resolve_link("", &new_stem)?.as_deref() == Some(to);
         let new_target = if stem_unique {
             new_stem
         } else {
             to.trim_end_matches(".md").to_string()
         };
+        let link_source = format!("{source} (link update)");
         let mut updated = 0;
-        for (src, raws) in referrers {
-            let src = if src == from { to.clone() } else { src };
-            let Ok(mut text) = self.vault.read(&src) else {
+        // The moved note: relative Markdown links (to itself as well) are re-based on its
+        // new folder, wikilinks to itself point at the new name.
+        let locate = |p: &str| {
+            if p == from {
+                Some(to.to_string())
+            } else if let Some(n) = moved.get(p) {
+                Some(n.clone())
+            } else {
+                Vault::clean(p)
+                    .is_ok_and(|c| self.vault.exists(&c))
+                    .then(|| p.to_string())
+            }
+        };
+        let mut text = retarget_md_links(&content, from, to, &locate);
+        if let Some((_, raws)) = referrers.iter().find(|(s, _)| s == from) {
+            text = rewrite_links(&text, to, raws, to, &new_target, false);
+        }
+        if text != content {
+            self.persist(to, &text, &link_source)?;
+            updated += 1;
+        }
+        for (src, raws) in referrers.iter().filter(|(s, _)| s != from) {
+            let Ok(text) = self.vault.read(src) else {
                 continue;
             };
-            let before = text.clone();
-            for raw in raws {
-                if raw.to_lowercase().ends_with(".md") || raw.contains("](") {
-                    // Markdown-style relative link: replace the exact target text.
-                    let rel = relative_link(&src, &to);
-                    text = text.replace(
-                        &format!("]({raw})"),
-                        &format!("]({})", render::url_encode(&rel)),
-                    );
-                    text = text.replace(
-                        &format!("]({raw}#"),
-                        &format!("]({}#", render::url_encode(&rel)),
-                    );
-                } else {
-                    let re = Regex::new(&format!(r"\[\[{}([\]|#^])", regex::escape(&raw))).unwrap();
-                    text = re
-                        .replace_all(&text, |c: &regex::Captures| {
-                            format!("[[{new_target}{}", &c[1])
-                        })
-                        .into_owned();
-                }
-            }
-            if text != before {
-                self.persist(&src, &text, &format!("{source} (link update)"))?;
+            let new = rewrite_links(&text, src, raws, to, &new_target, true);
+            if new != text {
+                self.persist(src, &new, &link_source)?;
                 updated += 1;
             }
         }
-        Ok((to, updated))
+        Ok((to.to_string(), updated))
     }
 
     pub fn create_folder(&self, path: &str) -> AResult<String> {
@@ -803,6 +868,9 @@ impl App {
             Some((s, e)) if !s.ends_with('/') => (s.to_string(), format!(".{e}")),
             _ => (base.clone(), String::new()),
         };
+        // Held from picking the name to writing, so concurrent uploads of `image.png`
+        // can't choose the same free name.
+        let _w = self.wlock();
         let mut path = base.clone();
         let mut n = 1;
         while self.vault.abs(&path).exists() {
@@ -865,18 +933,20 @@ impl App {
         Ok(v)
     }
 
-    /// Best-matching notes by meaning: (path, score, best chunk idx).
+    /// Best-matching notes by meaning: (path, score, best chunk idx). Only notes passing
+    /// `keep` are ranked, so filters don't eat into `limit`.
     fn nearest(
         &self,
         q: &[f32],
         exclude: Option<&str>,
         limit: usize,
         relative: f32,
+        keep: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<(String, f32, i64)>> {
         let vecs = self.vectors()?;
         let mut best: HashMap<&str, (f32, i64)> = HashMap::new();
         for (p, i, v) in vecs.iter() {
-            if Some(p.as_str()) == exclude || v.len() != q.len() {
+            if Some(p.as_str()) == exclude || v.len() != q.len() || !keep(p) {
                 continue;
             }
             let sc = crate::embed::dot(q, v);
@@ -912,7 +982,7 @@ impl App {
         let keyword = if mode == "semantic" && want_sem {
             Vec::new()
         } else {
-            self.idx().search(query, limit.max(30))?
+            self.keyword_hits(query, limit.max(30), !tags.is_empty() && !text.is_empty())?
         };
         if !want_sem {
             let mut hits = keyword;
@@ -935,17 +1005,17 @@ impl App {
                 });
             }
         };
-        let sem = self.nearest(&qv, None, limit.max(30), RELATIVE_CUTOFF)?;
+        // Filter before the top-N cut, so a rare tag or a small folder still gets its hits.
+        let tagged = if tags.is_empty() {
+            None
+        } else {
+            Some(self.idx().paths_with_tags(&tags)?)
+        };
+        let keep = |p: &str| {
+            in_folder(p, folder.as_deref()) && tagged.as_ref().is_none_or(|s| s.contains(p))
+        };
+        let sem = self.nearest(&qv, None, limit.max(30), RELATIVE_CUTOFF, &keep)?;
         let idx = self.idx();
-        let tag_ok = |t: &[String]| {
-            tags.iter()
-                .all(|q| t.iter().any(|x| x == q || x.starts_with(&format!("{q}/"))))
-        };
-        let folder_ok = |p: &str| {
-            folder
-                .as_deref()
-                .is_none_or(|f| f.is_empty() || p.starts_with(&format!("{f}/")))
-        };
 
         const K: f32 = 60.0;
         let mut fused: HashMap<String, (f32, Option<index::SearchHit>, Option<i64>)> =
@@ -955,15 +1025,10 @@ impl App {
             e.0 += 1.0 / (K + rank as f32 + 1.0);
             e.1 = Some(h);
         }
-        let mut rank = 0;
-        for (p, _score, ci) in sem {
-            if !folder_ok(&p) {
-                continue;
-            }
+        for (rank, (p, _score, ci)) in sem.into_iter().enumerate() {
             let e = fused.entry(p).or_insert((0.0, None, None));
             e.0 += 1.0 / (K + rank as f32 + 1.0);
             e.2 = Some(ci);
-            rank += 1;
         }
         let mut ranked: Vec<Fused> = fused.into_iter().collect();
         ranked.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
@@ -975,9 +1040,6 @@ impl App {
                     let Some((title, mtime, t)) = idx.title_mtime_tags(&path)? else {
                         continue;
                     };
-                    if !tag_ok(&t) {
-                        continue;
-                    }
                     let snippet = ci
                         .and_then(|i| idx.chunk_text(&path, i).ok().flatten())
                         .map(|c| short_snippet(&c))
@@ -1008,6 +1070,25 @@ impl App {
         })
     }
 
+    /// Keyword hits. Tag filters are applied after the full-text cut-off, so a rare tag
+    /// can come back short although more notes match: widen the window (bounded).
+    fn keyword_hits(
+        &self,
+        query: &str,
+        want: usize,
+        tag_filtered: bool,
+    ) -> Result<Vec<index::SearchHit>> {
+        let mut hits = Vec::new();
+        for n in [want, want * 4, want * 16] {
+            hits = self.idx().search(query, n)?;
+            if !tag_filtered || hits.len() >= want {
+                break;
+            }
+        }
+        hits.truncate(want);
+        Ok(hits)
+    }
+
     /// Notes closest in meaning to `path` (uses stored vectors only, no API call).
     pub fn related(&self, path: &str, limit: usize) -> AResult<Vec<Related>> {
         if self.embedder.is_none() {
@@ -1030,7 +1111,7 @@ impl App {
             }
         }
         let centroid = crate::embed::normalize(centroid);
-        let near = self.nearest(&centroid, Some(path), limit, RELATED_CUTOFF)?;
+        let near = self.nearest(&centroid, Some(path), limit, RELATED_CUTOFF, &|_| true)?;
         let idx = self.idx();
         let mut out = Vec::new();
         for (p, score, ci) in near {
@@ -1096,40 +1177,46 @@ impl App {
         if from == to {
             return Ok((to, 0, 0));
         }
-        if !self.vault.abs(&from).is_dir() {
-            return Err(AppError::NotFound(format!("folder not found: {from}")));
-        }
         if to.starts_with(&format!("{from}/")) {
             return Err(AppError::BadRequest(
                 "cannot move a folder into itself".into(),
             ));
         }
-        if self.vault.abs(&to).exists() {
-            return Err(AppError::Conflict(format!("{to} already exists")));
-        }
-        let (notes, files, dirs) = self.vault.scan();
-        let prefix = format!("{from}/");
-        let moved_notes: Vec<String> = notes
-            .into_iter()
-            .map(|e| e.rel)
-            .filter(|p| p.starts_with(&prefix))
-            .collect();
-        let moved_files: Vec<String> = files
-            .into_iter()
-            .map(|e| e.rel)
-            .filter(|p| p.starts_with(&prefix))
-            .collect();
-        let new_path = |p: &str| format!("{to}/{}", &p[prefix.len()..]);
-
-        // Notes one by one so that links pointing at them are rewritten.
-        let mut updated = 0;
-        for n in &moved_notes {
-            let (_, u) = self.rename_note(n, &new_path(n), source)?;
-            updated += u;
-        }
-        // Attachments and other files.
-        {
+        // One lock for the whole move, from the walk on.
+        let (count, updated) = {
             let _w = self.wlock();
+            if !self.vault.abs(&from).is_dir() {
+                return Err(AppError::NotFound(format!("folder not found: {from}")));
+            }
+            if self.vault.abs(&to).exists() {
+                return Err(AppError::Conflict(format!("{to} already exists")));
+            }
+            let (notes, files, dirs) = self.vault.scan();
+            let prefix = format!("{from}/");
+            let moved_notes: Vec<String> = notes
+                .into_iter()
+                .map(|e| e.rel)
+                .filter(|p| p.starts_with(&prefix))
+                .collect();
+            let moved_files: Vec<String> = files
+                .into_iter()
+                .map(|e| e.rel)
+                .filter(|p| p.starts_with(&prefix))
+                .collect();
+            let new_path = |p: &str| format!("{to}/{}", &p[prefix.len()..]);
+            // Where everything ends up, so relative links of moved notes stay intact.
+            let moved: HashMap<String, String> = moved_notes
+                .iter()
+                .chain(&moved_files)
+                .map(|p| (p.clone(), new_path(p)))
+                .collect();
+
+            // Notes one by one so that links pointing at them are rewritten.
+            let mut updated = 0;
+            for n in &moved_notes {
+                updated += self.rename_note_locked(n, &new_path(n), source, &moved)?.1;
+            }
+            // Attachments and other files.
             for f in &moved_files {
                 let dst = new_path(f);
                 self.vault.rename(f, &dst)?;
@@ -1139,6 +1226,7 @@ impl App {
                     idx.upsert_file(&dst, m.size as i64, m.mtime)?;
                 }
             }
+            updated += self.retarget_file_links(&moved_files, &new_path, &to, source)?;
             // Empty sub-folders, then remove the old tree (only empty dirs remain).
             for d in dirs.iter().filter(|d| d.starts_with(&prefix)) {
                 self.vault.mkdir(&new_path(d))?;
@@ -1152,9 +1240,60 @@ impl App {
             for d in old {
                 let _ = self.vault.rmdir(d);
             }
-        }
+            (moved_notes.len() + moved_files.len(), updated)
+        };
         self.sync(false)?;
-        Ok((to, moved_notes.len() + moved_files.len(), updated))
+        Ok((to, count, updated))
+    }
+
+    /// After a folder move: rewrites Markdown links in notes outside `to` that pointed at
+    /// the moved attachments (wikilinks still find them by name; the moved notes were
+    /// re-based by [`Self::rename_note_locked`]). Expects the write lock to be held.
+    fn retarget_file_links(
+        &self,
+        moved_files: &[String],
+        new_path: &dyn Fn(&str) -> String,
+        to: &str,
+        source: &str,
+    ) -> AResult<usize> {
+        if moved_files.is_empty() {
+            return Ok(0);
+        }
+        let map: HashMap<&str, String> = moved_files
+            .iter()
+            .map(|f| (f.as_str(), new_path(f)))
+            .collect();
+        // Cheap pre-filter: only notes that mention one of the file names.
+        let mut names: Vec<String> = moved_files
+            .iter()
+            .flat_map(|f| {
+                let name = f.rsplit('/').next().unwrap_or(f);
+                [
+                    regex::escape(name),
+                    regex::escape(&render::url_encode(name)),
+                ]
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        let mention = Regex::new(&names.join("|")).ok();
+        let candidates = self
+            .idx()
+            .note_paths_where(|c| mention.as_ref().is_none_or(|re| re.is_match(c)))?;
+        let inside = format!("{to}/");
+        let locate = |p: &str| map.get(p).cloned();
+        let mut updated = 0;
+        for src in candidates.iter().filter(|p| !p.starts_with(&inside)) {
+            let Ok(text) = self.vault.read(src) else {
+                continue;
+            };
+            let new = retarget_md_links(&text, src, src, &locate);
+            if new != text {
+                self.persist(src, &new, &format!("{source} (link update)"))?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 }
 
@@ -1172,9 +1311,11 @@ fn short_snippet(chunk: &str) -> String {
 /// Fills Obsidian-style template variables: `{{title}}`, `{{date}}`, `{{time}}`,
 /// `{{date:YYYY-MM-DD}}` / `{{time:HH:mm}}` (moment.js-style tokens).
 pub fn render_template(tpl: &str, title: &str) -> String {
+    static VAR: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\{\{\s*(title|date|time|datetime)(?::([^}]*))?\s*\}\}").unwrap()
+    });
     let now = chrono::Local::now();
-    let re = Regex::new(r"\{\{\s*(title|date|time|datetime)(?::([^}]*))?\s*\}\}").unwrap();
-    re.replace_all(tpl, |c: &regex::Captures| {
+    VAR.replace_all(tpl, |c: &regex::Captures| {
         let fmt = c.get(2).map(|m| m.as_str().trim());
         match (&c[1], fmt) {
             ("title", _) => title.to_string(),
@@ -1309,6 +1450,174 @@ fn relative_link(src: &str, dst: &str) -> String {
     let mut parts: Vec<String> = std::iter::repeat_n("..".to_string(), sd.len() - common).collect();
     parts.extend(dd[common..].iter().map(|s| s.to_string()));
     parts.join("/")
+}
+
+/// The `path:` filter, matched the way SQLite's LIKE does in keyword search
+/// (ASCII letters case-insensitively).
+fn in_folder(p: &str, folder: Option<&str>) -> bool {
+    match folder {
+        None | Some("") => true,
+        Some(f) => {
+            let (p, f) = (p.as_bytes(), f.as_bytes());
+            p.len() > f.len() && p[..f.len()].eq_ignore_ascii_case(f) && p[f.len()] == b'/'
+        }
+    }
+}
+
+/// Byte ranges of fenced code blocks and inline code spans, which link rewriting skips.
+fn code_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    // (fence char, fence length, start of the block)
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let start = pos;
+        pos += line.len();
+        let t = line.trim_start();
+        let run = |c: u8| t.bytes().take_while(|b| *b == c).count();
+        if let Some((c, n, from)) = fence {
+            let r = run(c);
+            if r >= n && t[r..].trim().is_empty() {
+                out.push((from, pos));
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(c @ (b'`' | b'~')) = t.bytes().next() {
+            let n = run(c);
+            // A backtick fence's info string can't contain backticks (that's inline code).
+            let inline = c == b'`' && t[n..].contains('`');
+            if n >= 3 && !inline {
+                fence = Some((c, n, start));
+                continue;
+            }
+        }
+        inline_code(line, start, &mut out);
+    }
+    if let Some((_, _, from)) = fence {
+        // An unclosed fence runs to the end.
+        out.push((from, text.len()));
+    }
+    out
+}
+
+/// Inline code spans of one line: a run of N backticks up to the next run of exactly N.
+fn inline_code(line: &str, base: usize, out: &mut Vec<(usize, usize)>) {
+    let b = line.as_bytes();
+    let run_end = |mut j: usize| {
+        while j < b.len() && b[j] == b'`' {
+            j += 1;
+        }
+        j
+    };
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let open = run_end(i);
+        let mut j = open;
+        let mut close = None;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let e = run_end(j);
+                if e - j == open - i {
+                    close = Some(e);
+                    break;
+                }
+                j = e;
+            } else {
+                j += 1;
+            }
+        }
+        match close {
+            Some(e) => {
+                out.push((base + i, base + e));
+                i = e;
+            }
+            None => i = open,
+        }
+    }
+}
+
+/// Applies `f` to the parts of `text` outside code, keeping code as it is.
+fn map_outside_code(text: &str, mut f: impl FnMut(&str) -> String) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (s, e) in code_ranges(text) {
+        out.push_str(&f(&text[last..s]));
+        out.push_str(&text[s..e]);
+        last = e;
+    }
+    out.push_str(&f(&text[last..]));
+    out
+}
+
+/// Points the links `raws` (as written in note `src`) at the renamed note `to`, outside
+/// code: wikilinks get `wiki_target`, Markdown links (with `markdown`) a relative path.
+fn rewrite_links(
+    text: &str,
+    src: &str,
+    raws: &[String],
+    to: &str,
+    wiki_target: &str,
+    markdown: bool,
+) -> String {
+    let rel = render::url_encode(&relative_link(src, to));
+    let wiki: Vec<Regex> = raws
+        .iter()
+        .filter_map(|raw| Regex::new(&format!(r"\[\[{}([\]|#^])", regex::escape(raw))).ok())
+        .collect();
+    map_outside_code(text, |seg| {
+        let mut s = seg.to_string();
+        if markdown {
+            for raw in raws.iter().filter(|r| r.to_lowercase().ends_with(".md")) {
+                s = s.replace(&format!("]({raw})"), &format!("]({rel})"));
+                s = s.replace(&format!("]({raw}#"), &format!("]({rel}#"));
+            }
+        }
+        for re in &wiki {
+            s = re
+                .replace_all(&s, |c: &regex::Captures| {
+                    format!("[[{wiki_target}{}", &c[1])
+                })
+                .into_owned();
+        }
+        s
+    })
+}
+
+static MD_LINK_TARGET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\]\(([^)\s]+)").unwrap());
+
+/// Re-bases relative Markdown link targets (outside code) of a note that was at `before`
+/// and is now at `after`: each target is resolved against `before`, `locate` tells where
+/// that file is now (`None` leaves the link alone), and the link is rewritten relative to
+/// `after` when it would no longer reach it.
+fn retarget_md_links(
+    text: &str,
+    before: &str,
+    after: &str,
+    locate: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    map_outside_code(text, |seg| {
+        MD_LINK_TARGET
+            .replace_all(seg, |c: &regex::Captures| {
+                let t = &c[1];
+                let (path, frag) = t.split_at(t.find(['#', '?']).unwrap_or(t.len()));
+                if path.is_empty() || path.starts_with(['/', '<']) || path.contains(':') {
+                    return c[0].to_string();
+                }
+                match locate(&note::join_relative(before, path)) {
+                    Some(now) if note::join_relative(after, path) != now => format!(
+                        "]({}{frag}",
+                        render::url_encode(&relative_link(after, &now))
+                    ),
+                    _ => c[0].to_string(),
+                }
+            })
+            .into_owned()
+    })
 }
 
 pub fn ensure_token(
@@ -1485,5 +1794,250 @@ mod tests {
         assert_eq!(a.idx().count().unwrap(), 1);
         std::fs::remove_file(d.path().join("ext.md")).unwrap();
         assert_eq!(a.full_sync().unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn sync_writes_only_what_changed() {
+        let (d, a) = app();
+        a.write_note("a/n.md", "x", None, "t").unwrap();
+        a.upload("p.png", b"png").unwrap();
+        let changes = |a: &App| {
+            a.idx()
+                .conn
+                .query_row("SELECT total_changes()", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(a.full_sync().unwrap(), (0, 0));
+        let before = changes(&a);
+        assert_eq!(a.full_sync().unwrap(), (0, 0));
+        assert_eq!(
+            changes(&a),
+            before,
+            "an unchanged vault must not be written"
+        );
+
+        std::fs::write(d.path().join("a/n.md"), "longer text").unwrap();
+        std::fs::create_dir_all(d.path().join("e/f")).unwrap();
+        std::fs::write(d.path().join("attachments/p.png"), b"bigger png").unwrap();
+        assert_eq!(a.full_sync().unwrap(), (1, 0));
+        assert_eq!(a.idx().search("longer", 5).unwrap().len(), 1);
+        let folders = a.idx().folders().unwrap();
+        assert!(folders.iter().any(|f| f == "e/f") && folders.iter().any(|f| f == "e"));
+        assert_eq!(
+            a.idx().all_file_states().unwrap()["attachments/p.png"].0,
+            10
+        );
+
+        std::fs::remove_dir_all(d.path().join("e")).unwrap();
+        std::fs::remove_file(d.path().join("attachments/p.png")).unwrap();
+        assert_eq!(a.full_sync().unwrap(), (0, 0));
+        assert!(
+            !a.idx()
+                .folders()
+                .unwrap()
+                .iter()
+                .any(|f| f.starts_with('e'))
+        );
+        assert!(a.idx().all_file_states().unwrap().is_empty());
+        assert_eq!(a.idx().count().unwrap(), 1);
+    }
+
+    #[test]
+    fn concurrent_uploads_get_distinct_names() {
+        let (_d, a) = app();
+        let paths: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8)
+                .map(|i| {
+                    let a = &a;
+                    s.spawn(move || a.upload("image.png", i.to_string().as_bytes()).unwrap())
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), 8);
+        let mut bodies: Vec<String> = paths
+            .iter()
+            .map(|p| String::from_utf8(a.read_file(p).unwrap()).unwrap())
+            .collect();
+        bodies.sort();
+        assert_eq!(bodies, (0..8).map(|i| i.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rename_keeps_vectors() {
+        let (_d, a) = app();
+        a.idx().chunking = true;
+        a.write_note("Old.md", "# Başlık\n\nsome text\n\nmore text", None, "t")
+            .unwrap();
+        let rows: Vec<_> = a
+            .idx()
+            .pending_chunks(100)
+            .unwrap()
+            .into_iter()
+            .map(|(p, i, h, _)| (p, i, h, vec![1.0f32, 0.0]))
+            .collect();
+        assert!(!rows.is_empty());
+        a.idx().store_vectors(&rows).unwrap();
+        a.rename_note("Old.md", "dir/New.md", "t").unwrap();
+        let n = rows.len() as i64;
+        assert_eq!(a.idx().embed_stats().unwrap(), (n, n));
+        assert!(
+            a.idx()
+                .load_vectors()
+                .unwrap()
+                .iter()
+                .all(|(p, _, _)| p == "dir/New.md")
+        );
+        assert!(a.idx().title_mtime_tags("Old.md").unwrap().is_none());
+        assert_eq!(
+            a.idx().title_mtime_tags("dir/New.md").unwrap().unwrap().0,
+            "Başlık"
+        );
+        assert_eq!(a.idx().search("some", 5).unwrap()[0].path, "dir/New.md");
+        assert_eq!(a.idx().revisions("dir/New.md").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn rename_skips_code_and_updates_self_links() {
+        let (_d, a) = app();
+        a.write_note(
+            "Old.md",
+            "# O\nself [[Old]] and [me](Old.md#top)\n```\n[[Old]]\n```\nand `[[Old]]` here\n",
+            None,
+            "t",
+        )
+        .unwrap();
+        a.write_note(
+            "Ref.md",
+            "[[Old]] `[[Old]]` ``[[Old]] ` x``\n~~~~\n[[Old|x]]\n```\n~~~~\n[[Old#h]]\n",
+            None,
+            "t",
+        )
+        .unwrap();
+        let (_, n) = a.rename_note("Old.md", "dir/New.md", "t").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            a.read_note("dir/New.md").unwrap().content,
+            "# O\nself [[New]] and [me](New.md#top)\n```\n[[Old]]\n```\nand `[[Old]]` here\n"
+        );
+        assert_eq!(
+            a.read_note("Ref.md").unwrap().content,
+            "[[New]] `[[Old]]` ``[[Old]] ` x``\n~~~~\n[[Old|x]]\n```\n~~~~\n[[New#h]]\n"
+        );
+        assert_eq!(a.idx().backlinks("dir/New.md").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn folder_rename_keeps_relative_links() {
+        let (_d, a) = app();
+        a.write_note("Out.md", "x", None, "t").unwrap();
+        a.vault.write("attachments/pic.png", b"p").unwrap();
+        a.vault.write("Eski/in.png", b"p").unwrap();
+        a.write_note(
+            "Eski/N.md",
+            "![](../attachments/pic.png) [o](../Out.md) ![](in.png) [m](M.md)\n`![](../attachments/pic.png)`",
+            None,
+            "t",
+        )
+        .unwrap();
+        a.write_note("Eski/M.md", "[n](N.md)", None, "t").unwrap();
+        a.write_note(
+            "Dış.md",
+            "![](Eski/in.png) ![x](Eski/in.png \"t\") ![](attachments/pic.png)",
+            None,
+            "t",
+        )
+        .unwrap();
+        a.full_sync().unwrap();
+        a.rename_folder("Eski", "Yeni/Alt", "t").unwrap();
+        assert_eq!(
+            a.read_note("Yeni/Alt/N.md").unwrap().content,
+            "![](../../attachments/pic.png) [o](../../Out.md) ![](in.png) [m](M.md)\n`![](../attachments/pic.png)`"
+        );
+        assert_eq!(a.read_note("Yeni/Alt/M.md").unwrap().content, "[n](N.md)");
+        assert_eq!(
+            a.read_note("Dış.md").unwrap().content,
+            "![](Yeni/Alt/in.png) ![x](Yeni/Alt/in.png \"t\") ![](attachments/pic.png)"
+        );
+        assert!(a.vault.exists("Yeni/Alt/in.png"));
+    }
+
+    #[test]
+    fn code_is_left_alone() {
+        let t = "a `x` b ``y ` z`` c\n````\n```\nin\n```\n````\nd ~~~ e\n~~~\nf\n";
+        assert_eq!(
+            map_outside_code(t, |s| s.to_uppercase()),
+            "A `x` B ``y ` z`` C\n````\n```\nin\n```\n````\nD ~~~ E\n~~~\nf\n"
+        );
+    }
+
+    #[test]
+    fn semantic_filters_apply_before_the_cut() {
+        let (_d, a) = app();
+        a.idx().chunking = true;
+        a.write_note("A/x.md", "alpha", None, "t").unwrap();
+        a.write_note("b/y.md", "beta #rare", None, "t").unwrap();
+        a.write_note("c/z.md", "gamma #rare/sub", None, "t")
+            .unwrap();
+        let rows: Vec<_> = a
+            .idx()
+            .pending_chunks(100)
+            .unwrap()
+            .into_iter()
+            .map(|(p, i, h, _)| {
+                let v = if p == "A/x.md" {
+                    vec![1.0f32, 0.0]
+                } else {
+                    vec![0.6, 0.8]
+                };
+                (p, i, h, v)
+            })
+            .collect();
+        a.idx().store_vectors(&rows).unwrap();
+        let q = [1.0f32, 0.0];
+        assert_eq!(
+            a.nearest(&q, None, 1, 0.0, &|_| true).unwrap()[0].0,
+            "A/x.md"
+        );
+        // The best hit overall is outside the folder; the filter must not leave nothing.
+        let in_b = a
+            .nearest(&q, None, 1, RELATIVE_CUTOFF, &|p| in_folder(p, Some("B")))
+            .unwrap();
+        assert_eq!(in_b.len(), 1);
+        assert_eq!(in_b[0].0, "b/y.md");
+
+        let tagged = |t: &[&str]| {
+            let tags: Vec<String> = t.iter().map(|s| s.to_string()).collect();
+            let mut v: Vec<String> = a
+                .idx()
+                .paths_with_tags(&tags)
+                .unwrap()
+                .into_iter()
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(tagged(&["rare"]), ["b/y.md", "c/z.md"]);
+        assert_eq!(tagged(&["rare/sub"]), ["c/z.md"]);
+        assert!(tagged(&["rar"]).is_empty());
+
+        assert!(in_folder("Notes/a.md", Some("notes")));
+        assert!(!in_folder("Notesx/a.md", Some("Notes")));
+        assert!(!in_folder("Notes", Some("Notes")));
+        assert!(in_folder("x.md", None) && in_folder("x.md", Some("")));
+    }
+
+    #[test]
+    fn rare_tags_survive_the_keyword_cut() {
+        let (_d, a) = app();
+        for i in 0..130 {
+            a.write_note(&format!("n{i}.md"), "alpha", None, "t")
+                .unwrap();
+        }
+        let long = format!("alpha #rare {}", "filler ".repeat(300));
+        a.write_note("rare.md", &long, None, "t").unwrap();
+        let hits = a.search("alpha #rare", 10, "keyword").unwrap().hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "rare.md");
     }
 }

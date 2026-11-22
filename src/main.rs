@@ -160,8 +160,8 @@ fn main() -> Result<()> {
         .init();
 
     let settings = Settings {
-        daily_dir: cli.daily_dir.clone(),
-        memory_dir: cli.memory_dir.clone(),
+        daily_dir: cli.daily_dir.trim_matches('/').to_string(),
+        memory_dir: cli.memory_dir.trim_matches('/').to_string(),
         templates_dir: cli.templates_dir.trim_matches('/').to_string(),
         ..Default::default()
     };

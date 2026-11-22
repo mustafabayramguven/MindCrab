@@ -1,8 +1,10 @@
 //! Watches the vault for changes made outside MindCrab (Obsidian, Syncthing, git, an editor…).
 
 use crate::app::App;
+use crate::vault::Vault;
 use notify::{RecursiveMode, Watcher};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -18,12 +20,30 @@ pub fn spawn(app: Arc<App>) {
         .expect("spawn watcher thread");
 }
 
+/// The vault path an event is about, or `None` when it can't matter: the data dir (the
+/// index and its WAL are written on every request), `.trash/`, temp files and other
+/// hidden paths, or anything outside the vault.
+fn relevant(vault: &Vault, data_dir: &Path, p: &Path) -> Option<String> {
+    if p.starts_with(data_dir) {
+        return None;
+    }
+    vault.rel_of(p)
+}
+
 fn run(app: Arc<App>) -> anyhow::Result<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<String>();
+    let vault = app.vault.clone();
+    let data_dir = app
+        .data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app.data_dir.clone());
+    // Filter here, so ignored paths never wake the loop below.
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             for p in ev.paths {
-                let _ = tx.send(p);
+                if let Some(rel) = relevant(&vault, &data_dir, &p) {
+                    let _ = tx.send(rel);
+                }
             }
         }
     })?;
@@ -36,18 +56,16 @@ fn run(app: Arc<App>) -> anyhow::Result<()> {
     loop {
         // Block for the first event, then collect a short burst (debounce).
         let first = rx.recv()?;
-        let mut batch = vec![first];
+        let mut rels = HashSet::from([first]);
         let deadline = std::time::Instant::now() + Duration::from_millis(400);
         while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok(p) => batch.push(p),
+                Ok(r) => {
+                    rels.insert(r);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(e) => return Err(e.into()),
             }
-        }
-        let rels: HashSet<String> = batch.iter().filter_map(|p| app.vault.rel_of(p)).collect();
-        if rels.is_empty() {
-            continue;
         }
         // Folder moves/deletes arrive as a single path; rescan in that case.
         let needs_full = rels.iter().any(|r| {
@@ -80,4 +98,33 @@ pub fn spawn_periodic(app: Arc<App>, every: Duration) {
             }
         })
         .expect("spawn rescan thread");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_paths_are_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let v = Vault::open(d.path()).unwrap();
+        let root = v.root();
+        let data = root.join(".mindcrab");
+        for p in [
+            data.join("index.db-wal"),
+            root.join(".trash/20260101-000000.000__n.md"),
+            root.join("a/.n.md.12-3.mc-tmp"),
+            root.join(".obsidian/workspace.json"),
+            root.to_path_buf(),
+        ] {
+            assert_eq!(relevant(&v, &data, &p), None, "{}", p.display());
+        }
+        // A data dir that is not hidden is ignored as well.
+        let custom = root.join("data");
+        assert_eq!(relevant(&v, &custom, &custom.join("index.db")), None);
+        assert_eq!(
+            relevant(&v, &data, &root.join("a/n.md")).as_deref(),
+            Some("a/n.md")
+        );
+    }
 }
