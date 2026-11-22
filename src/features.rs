@@ -10,6 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const IGNORE_FILE: &str = ".mcpignore";
 
@@ -63,11 +64,62 @@ impl App {
     }
 
     pub fn set_ai_ignore(&self, text: &str) -> AResult<()> {
+        use std::io::Write as _;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         if text.len() > 64 * 1024 {
             return Err(AppError::BadRequest("ignore file too large".into()));
         }
-        std::fs::write(self.vault.root().join(IGNORE_FILE), text).map_err(anyhow::Error::from)?;
+        let root = self.vault.root();
+        let path = root.join(IGNORE_FILE);
+        // Unique temp name in the same folder, then an atomic rename: readers see
+        // the old or the new rules, never a half-written file.
+        let tmp = root.join(format!(
+            "{IGNORE_FILE}.{}-{}.mc-tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Hold the cache lock so no reader caches the old rules in between.
+        let mut cache = self.ignore_cache.lock().unwrap_or_else(|p| p.into_inner());
+        let written = std::fs::File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(text.as_bytes())?;
+                f.sync_all()
+            })
+            .and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            *cache = (None, None);
+            return Err(anyhow::Error::from(e).into());
+        }
+        // Don't rely on the mtime to notice the change (two writes can share a tick).
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        *cache = (mtime, Some(Arc::new(Ignore::parse(text))));
         Ok(())
+    }
+
+    /// The note `remember` stores facts about `topic` in (`Memory/<topic>.md`).
+    /// Normalises exactly like [`App::remember`]; the MCP layer checks this path
+    /// against `.mcpignore` and the connection's folders before writing.
+    pub fn memory_topic_path(&self, topic: Option<&str>) -> String {
+        let topic = topic
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or("Inbox");
+        let clean: String = topic
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        format!(
+            "{}/{}.md",
+            self.settings.memory_dir,
+            clean.trim_start_matches('.')
+        )
     }
 
     /// Parsed `.mcpignore`, cached until the file changes.
@@ -311,16 +363,13 @@ impl App {
     // ------------------------------------------------------------ tasks
 
     pub fn tasks(&self, f: &TaskFilter, view: Option<&AiView>) -> AResult<Vec<TaskRow>> {
-        let ig = self.ignore();
         let q = f.query.as_deref().map(str::to_lowercase);
         Ok(self
             .idx()
             .tasks(f.include_done)?
             .into_iter()
-            .filter(|t| {
-                view.is_none_or(|v| v.can_read(&t.path))
-                    && (view.is_none() || !(t.private || ig.matches(&t.path)))
-            })
+            // `can_read` covers `.mcpignore`; the row's own flag is checked too.
+            .filter(|t| view.is_none_or(|v| !t.private && v.can_read(&t.path)))
             .filter(|t| {
                 f.path.as_deref().is_none_or(|p| {
                     t.path == p || t.path.starts_with(&format!("{}/", p.trim_matches('/')))
@@ -396,15 +445,35 @@ impl App {
             let idx = self.idx();
             (idx.all_meta()?, idx.tags_by_path()?)
         };
-        let ig = self.ignore();
+        // Cheap pre-filters with the same rules as `bases::run`, so only candidate
+        // rows get their frontmatter JSON parsed.
+        let folder = spec
+            .from
+            .as_deref()
+            .map(|f| f.trim_matches('/'))
+            .filter(|f| !f.is_empty())
+            .map(|f| format!("{f}/"));
+        let tag = spec
+            .tag
+            .as_deref()
+            .map(|t| t.trim_start_matches('#').to_lowercase());
+        let tag_prefix = tag.as_ref().map(|t| format!("{t}/"));
+        let empty = Vec::new();
         let parsed: Vec<(String, String, serde_json::Map<String, Value>, i64)> = metas
             .into_iter()
-            .filter(|(p, _, _, _, private)| {
-                view.is_none() || !(*private || ig.matches(p)) && view.unwrap().can_read(p)
+            // `can_read` covers `.mcpignore`; the row's own flag is checked too.
+            .filter(|(p, _, _, _, private)| view.is_none_or(|v| !*private && v.can_read(p)))
+            .filter(|(p, ..)| folder.as_ref().is_none_or(|f| p.starts_with(f.as_str())))
+            .filter(|(p, ..)| {
+                tag.as_ref().zip(tag_prefix.as_ref()).is_none_or(|(t, tp)| {
+                    tags.get(p)
+                        .unwrap_or(&empty)
+                        .iter()
+                        .any(|x| x == t || x.starts_with(tp.as_str()))
+                })
             })
             .map(|(p, t, fm, m, _)| (p, t, serde_json::from_str(&fm).unwrap_or_default(), m))
             .collect();
-        let empty = Vec::new();
         let rows: Vec<bases::Row> = parsed
             .iter()
             .map(|(p, t, fm, m)| bases::Row {
@@ -476,15 +545,35 @@ impl App {
     // ------------------------------------------------------------ previews & canvases
 
     pub fn preview(&self, path: &str, anchor: Option<&str>) -> AResult<String> {
+        const MAX_CHARS: usize = 4000;
         let path = self.find_note(path)?;
         let content = self.vault.read(&path)?;
-        let md = match anchor.filter(|a| !a.is_empty()) {
-            Some(a) => crate::render::section(&content, a).unwrap_or(content),
-            None => content,
+        // `keep` = bytes of frontmatter left in front of the text: it doesn't count
+        // towards the limit and stays whole, so `render` strips it as usual
+        // instead of showing a block that was cut in half.
+        let (md, keep) = match anchor
+            .filter(|a| !a.is_empty())
+            .and_then(|a| crate::render::section(&content, a))
+        {
+            Some(s) => (s, 0), // sections come without frontmatter
+            None => {
+                // The body is the tail of the content.
+                let body = note::split_frontmatter(&content).1.len();
+                let keep = content.len().saturating_sub(body);
+                let keep = if content.is_char_boundary(keep) {
+                    keep
+                } else {
+                    0
+                };
+                (content, keep)
+            }
         };
-        // Keep hover cards small.
-        let short: String = md.chars().take(4000).collect();
-        self.render(&path, &short)
+        // Keep hover cards small; cut on a char boundary.
+        let end = md[keep..]
+            .char_indices()
+            .nth(MAX_CHARS)
+            .map_or(md.len(), |(i, _)| keep + i);
+        self.render(&path, &md[..end])
     }
 
     pub fn read_canvas(&self, path: &str) -> AResult<String> {
@@ -605,6 +694,84 @@ mod tests {
         let v = a.ai_view(s).unwrap();
         assert!(v.can_read("Projeler/P.md") && !v.can_write("Projeler/P.md"));
         assert!(!v.can_read("Açık.md"));
+    }
+
+    #[test]
+    fn ai_ignore_applies_at_once() {
+        let (d, a) = app();
+        a.write_note("A/n.md", "x", None, "t").unwrap();
+        a.write_note("B/n.md", "y", None, "t").unwrap();
+        // Same-size rewrites in quick succession (possibly within one mtime tick).
+        for (rules, hidden) in [("A/\n", "A/n.md"), ("B/\n", "B/n.md"), ("A/\n", "A/n.md")] {
+            a.set_ai_ignore(rules).unwrap();
+            let v = a.ai_view(Scope::full("x", false, false)).unwrap();
+            assert!(!v.can_read(hidden), "{rules}");
+            assert_eq!(a.ai_hidden_paths().unwrap(), vec![hidden.to_string()]);
+        }
+        assert_eq!(a.ai_ignore_text(), "A/\n");
+        let leftovers: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".mc-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn memory_topic_path_matches_remember() {
+        let (_d, a) = app();
+        for topic in [
+            None,
+            Some("   "),
+            Some("Sunucular"),
+            Some("  Kişiler  "),
+            Some("a/b\\c"),
+            Some("..gizli"),
+            Some(".a/.b"),
+            Some("x:y*z?\"<>|"),
+        ] {
+            let r = a.remember("bir bilgi", topic, &[], "mcp:t").unwrap();
+            assert_eq!(r.path, a.memory_topic_path(topic), "{topic:?}");
+        }
+    }
+
+    #[test]
+    fn preview_skips_frontmatter() {
+        let (_d, a) = app();
+        let fm = format!("---\nnot: {}\n---\n", "çok-uzun-özellik ".repeat(400));
+        let body = format!("# Başlık\n\n{}", "ş".repeat(5000));
+        a.write_note("Uzun.md", &format!("{fm}{body}"), None, "t")
+            .unwrap();
+        let html = a.preview("Uzun", None).unwrap();
+        assert!(!html.contains("çok-uzun-özellik"), "frontmatter leaked");
+        assert!(html.contains("Başlık"));
+        let n = html.matches('ş').count();
+        assert!((3900..=4000).contains(&n), "{n}");
+    }
+
+    #[test]
+    fn base_prefilters_keep_results() {
+        let (_d, a) = app();
+        a.write_note("Kitap/A.md", "---\ntags: [kitap]\n---\n", None, "t")
+            .unwrap();
+        a.write_note("Kitap/B.md", "---\ntags: [kitap/roman]\n---\n", None, "t")
+            .unwrap();
+        a.write_note("Kitaplık.md", "---\ntags: [kitap]\n---\n", None, "t")
+            .unwrap();
+        a.write_note("C.md", "---\ntags: [diğer]\n---\n", None, "t")
+            .unwrap();
+        let total = |y: &str| {
+            a.base_query(&bases::parse_spec(y).unwrap(), None)
+                .unwrap()
+                .total
+        };
+        assert_eq!(total("tag: kitap"), 3);
+        assert_eq!(total("tag: '#kitap'"), 3);
+        assert_eq!(total("from: Kitap"), 2);
+        assert_eq!(total("from: /Kitap/\ntag: kitap"), 2);
+        assert_eq!(total("from: Kitap\ntag: diğer"), 0);
+        assert_eq!(total("where: has tags"), 4);
     }
 
     #[test]

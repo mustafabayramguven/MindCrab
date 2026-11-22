@@ -1,13 +1,17 @@
 //! Extra index tables: AI activity log, pending (unreviewed) facts, MCP
 //! connections and the task list.
 
-use crate::index::{Index, now_ms};
+use crate::index::{Index, Revision, now_ms};
 use crate::scope::Scope;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 const MAX_ACTIVITY: i64 = 5000;
+
+/// `last_used` of a connection is written at most this often (every MCP call
+/// would otherwise be a database write).
+const LAST_USED_EVERY_MS: i64 = 60_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Activity {
@@ -71,6 +75,17 @@ pub fn token_hash(token: &str) -> String {
 }
 
 impl Index {
+    /// Indexes for the tables used here: activity coalescing looks up the last
+    /// entry of a path, the due-task badge counts open tasks by date.
+    /// Idempotent; called at the end of [`Index::open`].
+    pub(crate) fn ensure_store_indexes(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS activity_path ON activity(path, id);
+             CREATE INDEX IF NOT EXISTS tasks_due ON tasks(done, due, scheduled);",
+        )?;
+        Ok(())
+    }
+
     pub fn max_rev(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -93,6 +108,57 @@ impl Index {
             .conn
             .prepare("SELECT path FROM notes WHERE private=1")?;
         Ok(st.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?)
+    }
+
+    // ------------------------------------------------------------ history seen by AI clients
+
+    /// Revisions of `path` an AI client may see, newest first (at most `limit`).
+    /// The walk stops at the newest revision whose own text hides it from AI
+    /// (`ai: false` …): that one and everything older stay hidden, because the
+    /// note was made private after they were written. This keeps the history of
+    /// a private note hidden even after the note itself was deleted.
+    pub fn ai_revisions(&self, path: &str, limit: usize) -> Result<Vec<Revision>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, path, hash, created_at, source, length(content), content FROM revisions WHERE path=?1 ORDER BY id DESC",
+        )?;
+        let mut rows = st.query([path])?;
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(r) = rows.next()? else { break };
+            if crate::scope::content_private(&r.get::<_, String>(6)?) {
+                break;
+            }
+            out.push(Revision {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                hash: r.get(2)?,
+                created_at: r.get(3)?,
+                source: r.get(4)?,
+                size: r.get(5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `(path, content)` of revision `id` when an AI client may see it: neither
+    /// it nor any later revision of the same note is private (see [`Self::ai_revisions`]).
+    pub fn ai_revision(&self, id: i64) -> Result<Option<(String, String)>> {
+        let Some((path, content)) = self.revision(id)? else {
+            return Ok(None);
+        };
+        if crate::scope::content_private(&content) {
+            return Ok(None);
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT content FROM revisions WHERE path=?1 AND id > ?2 ORDER BY id DESC")?;
+        let mut rows = st.query(params![path, id])?;
+        while let Some(r) = rows.next()? {
+            if crate::scope::content_private(&r.get::<_, String>(0)?) {
+                return Ok(None);
+            }
+        }
+        Ok(Some((path, content)))
     }
 
     // ------------------------------------------------------------ activity
@@ -212,29 +278,40 @@ impl Index {
         Ok(self.conn.last_insert_rowid())
     }
 
+    fn row_pending(r: &rusqlite::Row) -> rusqlite::Result<PendingFact> {
+        let tags: String = r.get(5)?;
+        Ok(PendingFact {
+            id: r.get(0)?,
+            ts: r.get(1)?,
+            source: r.get(2)?,
+            topic: r.get(3)?,
+            fact: r.get(4)?,
+            tags: serde_json::from_str(&tags).unwrap_or_default(),
+        })
+    }
+
     pub fn pending(&self) -> Result<Vec<PendingFact>> {
         let mut st = self
             .conn
             .prepare("SELECT id,ts,source,topic,fact,tags FROM pending_facts ORDER BY id")?;
         Ok(st
-            .query_map([], |r| {
-                let tags: String = r.get(5)?;
-                Ok(PendingFact {
-                    id: r.get(0)?,
-                    ts: r.get(1)?,
-                    source: r.get(2)?,
-                    topic: r.get(3)?,
-                    fact: r.get(4)?,
-                    tags: serde_json::from_str(&tags).unwrap_or_default(),
-                })
-            })?
+            .query_map([], Self::row_pending)?
             .collect::<Result<_, _>>()?)
     }
 
     pub fn take_pending(&self, id: i64) -> Result<Option<PendingFact>> {
-        let f = self.pending()?.into_iter().find(|p| p.id == id);
-        self.conn
-            .execute("DELETE FROM pending_facts WHERE id=?1", [id])?;
+        let f = self
+            .conn
+            .query_row(
+                "SELECT id,ts,source,topic,fact,tags FROM pending_facts WHERE id=?1",
+                [id],
+                Self::row_pending,
+            )
+            .optional()?;
+        if f.is_some() {
+            self.conn
+                .execute("DELETE FROM pending_facts WHERE id=?1", [id])?;
+        }
         Ok(f)
     }
 
@@ -306,7 +383,8 @@ impl Index {
             .collect::<Result<_, _>>()?)
     }
 
-    /// Looks up a connection by its token and records the use.
+    /// Looks up a connection by its token and records the use (at most once a
+    /// minute, so read-only calls don't each write to the database).
     pub fn connection_scope(&self, token: &str) -> Result<Option<Scope>> {
         let c = self
             .conn
@@ -317,10 +395,16 @@ impl Index {
             )
             .optional()?;
         if let Some(c) = &c {
-            self.conn.execute(
-                "UPDATE connections SET last_used=?2 WHERE id=?1",
-                params![c.id, now_ms()],
-            )?;
+            let now = now_ms();
+            // Also rewrite it when the clock went backwards.
+            if c.last_used
+                .is_none_or(|t| !(0..LAST_USED_EVERY_MS).contains(&(now - t)))
+            {
+                self.conn.execute(
+                    "UPDATE connections SET last_used=?2 WHERE id=?1",
+                    params![c.id, now],
+                )?;
+            }
         }
         Ok(c.map(|c| Scope {
             name: c.name,
@@ -422,5 +506,111 @@ mod tests {
         assert_eq!(i.pending_count().unwrap(), 1);
         assert_eq!(i.take_pending(pid).unwrap().unwrap().fact, "bir bilgi");
         assert_eq!(i.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn take_pending_by_id() {
+        let d = tempfile::tempdir().unwrap();
+        let i = Index::open(&d.path().join("i.db")).unwrap();
+        let a = i.add_pending("mcp:x", None, "bir", &[]).unwrap();
+        let b = i
+            .add_pending("mcp:x", Some("T"), "iki", &["t".into()])
+            .unwrap();
+        assert!(i.take_pending(b + 100).unwrap().is_none());
+        assert_eq!(i.pending_count().unwrap(), 2);
+        let f = i.take_pending(b).unwrap().unwrap();
+        assert_eq!(
+            (f.fact.as_str(), f.topic.as_deref(), f.tags),
+            ("iki", Some("T"), vec!["t".to_string()])
+        );
+        assert!(i.take_pending(b).unwrap().is_none());
+        assert_eq!(i.pending().unwrap()[0].id, a);
+    }
+
+    #[test]
+    fn last_used_is_throttled() {
+        let d = tempfile::tempdir().unwrap();
+        let i = Index::open(&d.path().join("i.db")).unwrap();
+        let id = i
+            .add_connection("c", "mcc_token_abcd", false, false, &[])
+            .unwrap();
+        let last = |i: &Index| i.connections().unwrap()[0].last_used;
+        assert!(last(&i).is_none());
+        i.connection_scope("mcc_token_abcd").unwrap().unwrap();
+        let first = last(&i).unwrap();
+        // A recent value is left alone…
+        i.conn
+            .execute(
+                "UPDATE connections SET last_used=?2 WHERE id=?1",
+                params![id, first - 1000],
+            )
+            .unwrap();
+        i.connection_scope("mcc_token_abcd").unwrap().unwrap();
+        assert_eq!(last(&i), Some(first - 1000));
+        // …an old one (or one in the future) is refreshed.
+        for stale in [first - LAST_USED_EVERY_MS - 1, first + 3_600_000] {
+            i.conn
+                .execute(
+                    "UPDATE connections SET last_used=?2 WHERE id=?1",
+                    params![id, stale],
+                )
+                .unwrap();
+            i.connection_scope("mcc_token_abcd").unwrap().unwrap();
+            let now = last(&i).unwrap();
+            assert!(now >= first && now < first + 3_600_000, "{stale} → {now}");
+        }
+    }
+
+    #[test]
+    fn store_indexes_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let i = Index::open(&d.path().join("i.db")).unwrap();
+        for name in ["activity_path", "tasks_due"] {
+            let n: i64 = i
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn ai_revisions_stop_at_private_versions() {
+        let d = tempfile::tempdir().unwrap();
+        let i = Index::open(&d.path().join("i.db")).unwrap();
+        let add = |path: &str, content: &str| -> i64 {
+            i.conn
+                .execute(
+                    "INSERT INTO revisions(path, content, hash, created_at, source) VALUES(?1,?2,'h',0,'t')",
+                    params![path, content],
+                )
+                .unwrap();
+            i.conn.last_insert_rowid()
+        };
+        let old = add("N.md", "açık ilk sürüm");
+        let private = add("N.md", "---\nai: false # gizli\n---\nsır");
+        let newer = add("N.md", "yeniden açık");
+        let other = add("Başka.md", "başka not");
+        let ids = |p: &str| -> Vec<i64> {
+            i.ai_revisions(p, 50)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids("N.md"), vec![newer]);
+        assert_eq!(ids("Başka.md"), vec![other]);
+        assert!(i.ai_revisions("N.md", 0).unwrap().is_empty());
+        assert!(i.ai_revision(old).unwrap().is_none());
+        assert!(i.ai_revision(private).unwrap().is_none());
+        assert_eq!(i.ai_revision(newer).unwrap().unwrap().1, "yeniden açık");
+        assert!(i.ai_revision(other).unwrap().is_some());
+        assert!(i.ai_revision(9999).unwrap().is_none());
+        // The usual listing still shows everything to the user.
+        assert_eq!(i.revisions("N.md").unwrap().len(), 3);
     }
 }
