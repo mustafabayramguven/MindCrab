@@ -14,7 +14,7 @@ pub const SNIP_END: char = '\u{E001}';
 const MAX_REVISIONS_PER_NOTE: i64 = 100;
 
 /// Bump when derived data changes shape; forces a full re-read of the vault.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Web autosaves within this window share one revision (the state before the editing session).
 pub const COALESCE_MS: i64 = 5 * 60 * 1000;
